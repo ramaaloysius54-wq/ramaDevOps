@@ -26,15 +26,19 @@ jobs:
       - name: 🗄️ Generate Prisma Client
         run: npx prisma generate
 
-      - name: 🚀 Deploy to VPS via SSH
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: 22
-          script_stop: true
-          script: |
+      - name: 🚀 Deploy to VPS via SSHPass
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          if [ -z "$SSHPASS" ] || [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ]; then
+            echo "❌ ERROR: Secret VPS_HOST, VPS_USER, atau VPS_PASSWORD kosong!"
+            echo "Pastikan disimpan di Repository Secrets, bukan Environment Secrets."
+            exit 1
+          fi
+          sudo apt-get update && sudo apt-get install -y sshpass
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password,keyboard-interactive -p 22 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
             echo "Memulai Deployment di VPS..."
             cd /var/www/rama_bot
             git reset --hard HEAD
@@ -43,3 +47,4 @@ jobs:
             npx prisma generate
             pm2 restart ramabot
             echo "Deployment Sukses!"
+          ENDSSH
