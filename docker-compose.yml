@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ramastore_app
+    restart: always
+    ports:
+      - "3000:3000"
+      - "4000:4000"
+    env_file:
+      - .env
+    volumes:
+      - baileys_auth:/app/baileys_auth_info
+
+volumes:
+  baileys_auth:
