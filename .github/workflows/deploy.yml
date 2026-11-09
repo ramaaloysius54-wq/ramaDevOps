@@ -35,8 +35,11 @@ jobs:
           
           echo "3. Menjalankan NPM Install & Restart PM2 di VPS..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
+            export PATH=$PATH:/usr/local/bin:/usr/bin:~/.npm-global/bin
             cd /var/www/rama_bot
             npm install
             npx prisma generate
-            pm2 restart ramabot || pm2 start index.js --name ramabot
+            npm install -g pm2
+            npx pm2 restart ramabot || npx pm2 start index.js --name ramabot
+            npx pm2 save
           ENDSSH
