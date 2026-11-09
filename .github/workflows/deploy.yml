@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-and-deploy:
-    name: Build & Deploy to VPS
+    name: rama DevOps
     runs-on: ubuntu-latest
 
     steps:
@@ -18,28 +18,25 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: 📦 Install Dependencies
-        run: npm ci
-
-      - name: 🗄️ Generate Prisma Client
-        run: npx prisma generate
-
-      - name: 🚀 Deploy to VPS via SSHPass
+      - name: 🚀 Full Automated CI/CD Deploy
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
         run: |
-          sudo apt-get update && sudo apt-get install -y sshpass
-          sshpass -e ssh -v -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
-            echo "Memulai Deployment di VPS..."
+          sudo apt-get update && sudo apt-get install -y sshpass rsync
+          
+          echo "1. Mempersiapkan folder di VPS..."
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" "mkdir -p /var/www/rama_bot"
+          
+          echo "2. Mentransfer semua file dari GitHub ke VPS..."
+          sshpass -e rsync -avz --exclude='.git' --exclude='node_modules' -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198" ./ "$VPS_USER@$VPS_HOST:/var/www/rama_bot/"
+          
+          echo "3. Menjalankan NPM Install & Restart PM2 di VPS..."
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
             cd /var/www/rama_bot
-            git reset --hard HEAD
-            git pull origin main
             npm install
             npx prisma generate
-            pm2 restart ramabot
-            echo "Deployment Sukses!"
+            pm2 restart ramabot || pm2 start index.js --name ramabot
           ENDSSH
