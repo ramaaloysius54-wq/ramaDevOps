@@ -1,4 +1,4 @@
-name: CI/CD Pipeline Rama Store Bot
+name: CI/CD Pipeline Rama DevOps
 
 on:
   push:
