@@ -31,22 +31,15 @@ jobs:
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_KEY }}
+          password: ${{ secrets.VPS_PASSWORD }}
           port: 22
           script_stop: true
           script: |
             echo "Memulai Deployment di VPS..."
             cd /var/www/rama_bot
-            
-            # Reset perubahan lokal di VPS (jika ada) agar git pull tidak konflik
             git reset --hard HEAD
             git pull origin main
-            
-            # Install dependencies & generate prisma di VPS
             npm install
             npx prisma generate
-            
-            # Restart aplikasi PM2
             pm2 restart ramabot
-            
             echo "Deployment Sukses!"
