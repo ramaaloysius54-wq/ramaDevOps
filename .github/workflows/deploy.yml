@@ -1,52 +1,17 @@
-name: CI/CD Pipeline Rama DevOps
-
-on:
-  push:
-    branches:
-      - main
-
-jobs:
-  build-and-deploy:
-    name: Build & Deploy to VPS
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: ⚙️ Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: 📦 Install Dependencies
-        run: npm ci
-
-      - name: 🗄️ Generate Prisma Client
-        run: npx prisma generate
-
       - name: 🚀 Deploy to VPS via SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_KEY }} # 👈 Ganti parameter 'password' menjadi 'key'
           port: 22
           script_stop: true
           script: |
             echo "Memulai Deployment di VPS..."
             cd /var/www/rama_bot
-            
-            # Reset perubahan lokal di VPS (jika ada) agar git pull tidak konflik
             git reset --hard HEAD
             git pull origin main
-            
-            # Install dependencies & generate prisma di VPS
             npm install
             npx prisma generate
-            
-            # Restart aplikasi PM2
             pm2 restart ramabot
-            
             echo "Deployment Sukses!"
