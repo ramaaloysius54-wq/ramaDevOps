@@ -1,5 +1,4 @@
-name: CI/CD Pipeline Rama DevOps
-
+Name: CI/CD Pipeline Rama DevOps
 on:
   push:
     branches:
@@ -38,10 +37,14 @@ jobs:
             echo "Memulai Deployment di VPS..."
             cd /var/www/rama_bot
             
+            # Pastikan mengambil update terbaru
             git pull origin main
+            
+            # Install dependencies & generate prisma di VPS
             npm install
             npx prisma generate
             
+            # Restart aplikasi PM2
             pm2 restart ramabot
             
             echo "Deployment Sukses!"
