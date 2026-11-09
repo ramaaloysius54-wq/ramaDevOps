@@ -38,7 +38,8 @@ jobs:
             echo "Memulai Deployment di VPS..."
             cd /var/www/rama_bot
             
-            # Pastikan mengambil update terbaru
+            # Reset perubahan lokal di VPS (jika ada) agar git pull tidak konflik
+            git reset --hard HEAD
             git pull origin main
             
             # Install dependencies & generate prisma di VPS
