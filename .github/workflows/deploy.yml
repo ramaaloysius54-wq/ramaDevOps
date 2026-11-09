@@ -1,4 +1,5 @@
-Name: CI/CD Pipeline Rama DevOps
+name: CI/CD Pipeline Rama DevOps
+
 on:
   push:
     branches:
