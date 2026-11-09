@@ -1,0 +1,58 @@
+name: CI/CD Pipeline Rama Store Bot
+
+on:
+  push:
+    branches:
+      - main # Pipeline berjalan setiap ada kode baru di branch main
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy to VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Mengambil kode terbaru dari repository
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. Persiapan Environment CI
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # 3. Proses CI (Testing & Build di Server GitHub)
+      - name: 📦 Install Dependencies
+        run: npm ci
+
+      - name: 🗄️ Generate Prisma Client
+        run: npx prisma generate
+
+      # (Opsional) Jika Anda menggunakan TypeScript build (tsc)
+      # - name: 🏗️ Build Project
+      #   run: npm run build
+
+      # 4. Proses CD (Deploy Otomatis ke VPS)
+      - name: 🚀 Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            echo "Memulai Deployment di VPS..."
+            cd /var/www/rama_bot
+            
+            # Tarik kode terbaru dari GitHub
+            git pull origin main
+            
+            # Install package baru (jika ada) & Generate DB
+            npm install
+            npx prisma generate
+            
+            # Restart Bot Tanpa Downtime
+            pm2 restart ramabot
+            
+            echo "Deployment Sukses! Bot sudah menyala dengan kode terbaru."
