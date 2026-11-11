@@ -257,6 +257,119 @@ async function startWhatsApp() {
 
         const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim();
         if (!text) continue;
+
+        // =========================================================================
+        // FITUR TAMBAHAN: ADMIN REPLY BUKTI TRANSFER DENGAN KATA "PROSES"
+        // =========================================================================
+        if (msg.key.fromMe && text.toLowerCase() === "proses") {
+          const quotedInfo = msg.message.extendedTextMessage?.contextInfo;
+          const quotedMsg = quotedInfo?.quotedMessage;
+
+          if (quotedMsg) {
+            // Ambil teks baik dari percakapan teks biasa, extended, atau caption gambar bukti transfer
+            const quotedContent = (
+              quotedMsg.conversation ||
+              quotedMsg.extendedTextMessage?.text ||
+              quotedMsg.imageMessage?.caption ||
+              ""
+            ).toLowerCase();
+
+            let matchedProduct: any = null;
+            let finalPrice = 25000; // Nilai default bila tidak terdeteksi
+            let finalName = "Layanan Premium";
+
+            try {
+              const allProducts = await prisma.product.findMany();
+              for (const p of allProducts) {
+                if (
+                  (p.sku && quotedContent.includes(p.sku.toLowerCase())) ||
+                  quotedContent.includes(p.name.toLowerCase())
+                ) {
+                  matchedProduct = p;
+                  finalPrice = Number(p.price);
+                  finalName = p.name;
+                  break;
+                }
+              }
+            } catch (e) {}
+
+            // Fallback pencocokan keyword bila belum ada di tabel Product
+            if (!matchedProduct) {
+              if (quotedContent.includes("capcut")) { finalName = "CapCut Pro"; finalPrice = 25000; }
+              else if (quotedContent.includes("netflix")) { finalName = "Netflix Premium"; finalPrice = 40000; }
+              else if (quotedContent.includes("canva")) { finalName = "Canva Pro"; finalPrice = 15000; }
+              else if (quotedContent.includes("bot") || quotedContent.includes("web")) { finalName = "Jasa Pembuatan Bot/Web"; finalPrice = 100000; }
+            }
+
+            // Dapatkan nomor WA pelanggan dari quoted context
+            const targetJid = quotedInfo?.participant || remoteJid;
+            const targetPhone = targetJid.split("@")[0].split(":")[0];
+
+            try {
+              // 1. Simpan ke database Customer jika belum ada
+              const customerRecord = await prisma.customer.upsert({
+                where: { phone: targetPhone },
+                update: {},
+                create: { phone: targetPhone, name: "Pelanggan Rama Store", isBlocked: false }
+              });
+
+              // 2. Buat record Order / Pesanan
+              const orderNum = `RS-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+              await prisma.order.create({
+                data: {
+                  orderNumber: orderNum,
+                  customerId: customerRecord.id,
+                  subtotal: finalPrice,
+                  totalAmount: finalPrice,
+                  status: "PROCESSING",
+                  customerNotes: `Bukti transfer diverifikasi admin (${finalName})`,
+                  items: matchedProduct ? {
+                    create: {
+                      productId: matchedProduct.id,
+                      productName: matchedProduct.name,
+                      unitPrice: finalPrice,
+                      quantity: 1,
+                      subtotal: finalPrice
+                    }
+                  } : undefined
+                }
+              });
+
+              // 3. Catat / Update Omset
+              const todayDate = new Date();
+              todayDate.setHours(0, 0, 0, 0);
+
+              try {
+                if ((prisma as any).omset) {
+                  await (prisma as any).omset.upsert({
+                    where: { tanggal: todayDate },
+                    update: { total: { increment: finalPrice } },
+                    create: { tanggal: todayDate, total: finalPrice }
+                  });
+                }
+              } catch (omsetErr) {}
+
+              // 4. Balas otomatis: Transaksi Sedang Diproses
+              const prosesText = `⏳ *TRANSAKSI SEDANG DIPROSES*
+
+Halo Kak! Bukti pembayaran telah kami terima dan diverifikasi.
+
+📦 Layanan: *${finalName}*
+💰 Total: *Rp ${finalPrice.toLocaleString("id-ID")}*
+Status: *SEDANG DIPROSES* ⚙️
+
+Pesanan/akun Anda sedang disiapkan oleh admin. Mohon ditunggu 5-10 menit, ya!`;
+
+              await sendTextMessage(remoteJid, null, prosesText);
+              io.emit("dashboard:stats_update");
+            } catch (err) {
+              console.error("Gagal memproses pesanan otomatis:", err);
+            }
+            continue; // Lanjut ke pesan berikutnya
+          }
+        }
+        // =========================================================================
+
         if (msg.key.fromMe && recentBotReplies.has(text)) continue;
 
         const senderPhone = remoteJid.split("@")[0].split(":")[0];

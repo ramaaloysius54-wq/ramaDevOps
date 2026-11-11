@@ -19,7 +19,13 @@ jobs:
         with:
           node-version: '20'
 
-      - name: 🚀 Full Automated CI/CD Deploy
+      - name: 🧪 Clean Install & Build (Di GitHub)
+        run: |
+          npm ci
+          npx prisma generate
+          npm run build --if-present
+
+      - name: 🚀 Sync & Restart di VPS (/var/www/rama_bot)
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -27,19 +33,23 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y sshpass rsync
           
-          echo "1. Mempersiapkan folder di VPS..."
-          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" "mkdir -p /var/www/rama_bot"
+          echo "1. Mengirim file terbaru ke VPS..."
+          sshpass -e rsync -avz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.env' \
+            --exclude='baileys_auth_info' \
+            -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198" \
+            ./ "$VPS_USER@$VPS_HOST:/var/www/rama_bot/"
           
-          echo "2. Mentransfer semua file dari GitHub ke VPS..."
-          sshpass -e rsync -avz --exclude='.git' --exclude='node_modules' -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198" ./ "$VPS_USER@$VPS_HOST:/var/www/rama_bot/"
-          
-          echo "3. Menjalankan NPM Install & Restart PM2 di VPS..."
+          echo "2. Install module & Restart PM2 di VPS..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
             export PATH=$PATH:/usr/local/bin:/usr/bin:~/.npm-global/bin
             cd /var/www/rama_bot
-            npm install
+            
+            npm ci
             npx prisma generate
-            npm install -g pm2
-            npx pm2 restart ramabot || npx pm2 start index.js --name ramabot
-            npx pm2 save
+            
+            pm2 restart all
+            pm2 save
           ENDSSH

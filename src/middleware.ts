@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/request";
 import { jwtVerify } from "jose";
 
+
 const SECRET_KEY = new TextEncoder().encode(
   process.env.JWT_SECRET || "fallback-secret-development-key-change-it"
 );
