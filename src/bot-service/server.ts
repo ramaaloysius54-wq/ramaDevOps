@@ -125,11 +125,12 @@ async function startWhatsApp() {
       defaultQueryTimeoutMs: 0,
       generateHighQualityLinkPreview: false,
       msgRetryCounterCache: {
-        get: (key) => msgRetryCounterMap.get(key),
-        set: (key, value) => msgRetryCounterMap.set(key, value),
-        del: (key) => msgRetryCounterMap.delete(key),
+        get: (key: string) => msgRetryCounterMap.get(key),
+        set: (key: string, value: any) => msgRetryCounterMap.set(key, value),
+        del: (key: string) => msgRetryCounterMap.delete(key),
         flushAll: () => msgRetryCounterMap.clear(),
-      },
+      } as any,
+
       getMessage: async (key) => {
         if (key.id) {
           const cached = messageCache.get(key.id);
