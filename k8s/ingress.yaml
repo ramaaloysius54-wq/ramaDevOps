@@ -3,7 +3,7 @@ kind: Ingress
 metadata:
   name: rama-ingress
   annotations:
-    ingress.kubernetes.io/ssl-redirect: "false" # Karena SSL sudah diurus Cloudflare
+    ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   rules:
   - host: tabunganrama.my.id

@@ -7,45 +7,50 @@ spec:
   selector:
     matchLabels:
       app: web-dashboard
+      role: bot-engine
   template:
     metadata:
       labels:
         app: web-dashboard
+        role: bot-engine
     spec:
+      enableServiceLinks: false
       containers:
       - name: web
-        image: ramaaloysius/rama-app:latest
-        imagePullPolicy: Always
-        command: ["sh", "-c", "npx prisma migrate deploy && npm run start"]
+        image: node:20
+        workingDir: /app
+        command: ["sh", "-c", "npm run start"]
         ports:
         - containerPort: 3000
-        resources:
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: bot-engine
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: bot-engine
-  template:
-    metadata:
-      labels:
-        app: bot-engine
-    spec:
-      containers:
-      - name: bot
-        image: ramaaloysius/rama-app:latest
-        imagePullPolicy: Always
-        command: ["sh", "-c", "npm run bot:start"]
+        env:
+        - name: HOSTNAME
+          value: "0.0.0.0"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "3000"
+        - name: BOT_SERVICE_PORT
+          value: "4000"
+        - name: BOT_PORT
+          value: "4000"
+        volumeMounts:
+        - name: app-volume
+          mountPath: /app
+      - name: engine
+        image: node:20
+        workingDir: /app
+        command: ["sh", "-c", "npm run bot:build && (node dist-bot/server.js || node dist-bot/bot-service/server.js)"]
         ports:
         - containerPort: 4000
-        resources:
-          limits:
-            memory: "256Mi"
-            cpu: "300m"
+        env:
+        - name: PORT
+          value: "4000"
+        - name: BOT_SERVICE_PORT
+          value: "4000"
+        volumeMounts:
+        - name: app-volume
+          mountPath: /app
+      volumes:
+      - name: app-volume
+        hostPath:
+          path: /var/www/rama_bot
