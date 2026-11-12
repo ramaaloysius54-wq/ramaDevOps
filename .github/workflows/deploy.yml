@@ -86,7 +86,7 @@ jobs:
                 - name: web
                   image: node:20
                   workingDir: /app
-                  command: ["sh", "-c", "npx prisma db push --accept-data-loss && npm run start"]
+                  command: ["sh", "-c", "npm run start"]
                   ports:
                   - containerPort: 3000
                   env:
