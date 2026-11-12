@@ -84,7 +84,7 @@ jobs:
               spec:
                 containers:
                 - name: web
-                  image: node:20-alpine
+                  image: node:20
                   workingDir: /app
                   command: ["sh", "-c", "npx prisma migrate deploy && npm run start"]
                   ports:
@@ -113,9 +113,9 @@ jobs:
               spec:
                 containers:
                 - name: engine
-                  image: node:20-alpine
+                  image: node:20
                   workingDir: /app
-                  command: ["sh", "-c", "npm run bot:build && npm run bot:start"]
+                  command: ["sh", "-c", "npm run bot:build && node dist-bot/bot-service/server.js"]
                   ports:
                   - containerPort: 4000
                   volumeMounts:
