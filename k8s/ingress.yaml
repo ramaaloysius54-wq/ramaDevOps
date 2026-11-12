@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rama-ingress
+  annotations:
+    ingress.kubernetes.io/ssl-redirect: "false" # Karena SSL sudah diurus Cloudflare
+spec:
+  rules:
+  - host: tabunganrama.my.id
+    http:
+      paths:
+      - path: /api/bot
+        pathType: Prefix
+        backend:
+          service:
+            name: bot-service
+            port:
+              number: 4000
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: web-service
+            port:
+              number: 80

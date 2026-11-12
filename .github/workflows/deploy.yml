@@ -24,6 +24,7 @@ jobs:
           npm ci
           npx prisma generate
           npm run build --if-present
+          npm run bot:build --if-present
 
       - name: 🚀 Sync & Restart di VPS (/var/www/rama_bot)
         env:
@@ -53,3 +54,109 @@ jobs:
             pm2 restart all
             pm2 save
           ENDSSH
+
+      - name: ☸️ Deploy & Rollout Kubernetes (K3s) di VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          SSHPASS: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          echo "3. Menjalankan Orkestrasi Pods Kubernetes (K3s)..."
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
+            mkdir -p /var/www/k8s-rama
+            cd /var/www/k8s-rama
+
+            cat << 'EOF' > deployment.yaml
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: web-dashboard
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: web-dashboard
+            template:
+              metadata:
+                labels:
+                  app: web-dashboard
+              spec:
+                containers:
+                - name: web
+                  image: node:20-alpine
+                  workingDir: /app
+                  command: ["sh", "-c", "node -e \"require('http').createServer((req,res)=>res.end('Rama Web Dashboard Pod Active')).listen(3000)\""]
+                  ports:
+                  - containerPort: 3000
+                  volumeMounts:
+                  - name: app-volume
+                    mountPath: /app
+                volumes:
+                - name: app-volume
+                  hostPath:
+                    path: /var/www/rama_bot
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: bot-engine
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: bot-engine
+            template:
+              metadata:
+                labels:
+                  app: bot-engine
+              spec:
+                containers:
+                - name: engine
+                  image: node:20-alpine
+                  workingDir: /app
+                  command: ["sh", "-c", "node -e \"require('http').createServer((req,res)=>res.end('Rama Bot Engine Pod Active')).listen(4000)\""]
+                  ports:
+                  - containerPort: 4000
+                  volumeMounts:
+                  - name: app-volume
+                    mountPath: /app
+                volumes:
+                - name: app-volume
+                  hostPath:
+                    path: /var/www/rama_bot
+          EOF
+
+            cat << 'EOF' > service.yaml
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: web-service
+          spec:
+            selector:
+              app: web-dashboard
+            ports:
+              - protocol: TCP
+                port: 80
+                targetPort: 3000
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: bot-service
+          spec:
+            selector:
+              app: bot-engine
+            ports:
+              - protocol: TCP
+                port: 4000
+                targetPort: 4000
+          EOF
+
+            kubectl apply -f deployment.yaml
+            kubectl apply -f service.yaml
+            kubectl rollout restart deployment/web-dashboard
+            kubectl rollout restart deployment/bot-engine
+            sleep 5
+            kubectl get pods -o wide
+            kubectl get svc
+          ENDK8S

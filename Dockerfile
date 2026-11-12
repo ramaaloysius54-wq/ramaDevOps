@@ -27,4 +27,4 @@ COPY --from=build /app/prisma ./prisma
 
 EXPOSE 3000 4000
 
-CMD ["sh", "-c", "npx prisma migrate deploy && npm run start & npm run bot:start"]
+# Kosongkan CMD spesifik, karena eksekusinya akan diatur oleh Kubernetes YAML
