@@ -63,6 +63,7 @@ jobs:
         run: |
           echo "3. Menjalankan Orkestrasi Pods Kubernetes (K3s)..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
             mkdir -p /var/www/k8s-rama
             cd /var/www/k8s-rama
 
@@ -72,7 +73,7 @@ jobs:
           metadata:
             name: web-dashboard
           spec:
-            replicas: 2
+            replicas: 1
             selector:
               matchLabels:
                 app: web-dashboard
@@ -85,7 +86,7 @@ jobs:
                 - name: web
                   image: node:20-alpine
                   workingDir: /app
-                  command: ["sh", "-c", "node -e \"require('http').createServer((req,res)=>res.end('Rama Web Dashboard Pod Active')).listen(3000)\""]
+                  command: ["sh", "-c", "npx prisma migrate deploy && npm run start"]
                   ports:
                   - containerPort: 3000
                   volumeMounts:
@@ -114,7 +115,7 @@ jobs:
                 - name: engine
                   image: node:20-alpine
                   workingDir: /app
-                  command: ["sh", "-c", "node -e \"require('http').createServer((req,res)=>res.end('Rama Bot Engine Pod Active')).listen(4000)\""]
+                  command: ["sh", "-c", "npm run bot:build && npm run bot:start"]
                   ports:
                   - containerPort: 4000
                   volumeMounts:

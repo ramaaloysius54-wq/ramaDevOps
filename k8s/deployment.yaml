@@ -1,12 +1,9 @@
-# ----------------------------------------
-# 1. DEPLOYMENT UNTUK WEB DASHBOARD
-# ----------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: web-dashboard
 spec:
-  replicas: 2 # Kita jalankan 2 Pod Web agar jika 1 mati, web tidak down
+  replicas: 1
   selector:
     matchLabels:
       app: web-dashboard
@@ -17,8 +14,8 @@ spec:
     spec:
       containers:
       - name: web
-        image: ramaaloysius/rama-app:latest # Menggunakan image monorepo lu
-        # K8s hanya menyuruh image ini menjalankan Web + Migrate Database
+        image: ramaaloysius/rama-app:latest
+        imagePullPolicy: Always
         command: ["sh", "-c", "npx prisma migrate deploy && npm run start"]
         ports:
         - containerPort: 3000
@@ -26,17 +23,13 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
-
 ---
-# ----------------------------------------
-# 2. DEPLOYMENT UNTUK BOT ENGINE WA
-# ----------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: bot-engine
 spec:
-  replicas: 1 # Bot WA cukup 1 Pod agar sesi koneksi WA tidak bentrok
+  replicas: 1
   selector:
     matchLabels:
       app: bot-engine
@@ -47,8 +40,8 @@ spec:
     spec:
       containers:
       - name: bot
-        image: ramaaloysius/rama-app:latest # Menggunakan image yang SAMA PERSIS
-        # Tapi K8s hanya menyuruh image ini menjalankan engine Bot saja
+        image: ramaaloysius/rama-app:latest
+        imagePullPolicy: Always
         command: ["sh", "-c", "npm run bot:start"]
         ports:
         - containerPort: 4000
