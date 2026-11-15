@@ -230,10 +230,10 @@ async function startWhatsApp() {
     });
 
     sock.ev.on("call", async (calls: any[]) => {
-      let isAutoRejectActive = true;
+     let isAutoRejectActive = true;
       try {
         const config = await prisma.botConfig.findUnique({ where: { id: "default-config" } });
-        if (config) isAutoRejectActive = config.isAutoRejectActive ?? config.isAutoRejectCalls;
+        if (config) isAutoRejectActive = config.isAutoRejectCalls;
       } catch (e) {}
 
       for (const call of calls) {
