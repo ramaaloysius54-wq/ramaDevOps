@@ -40,11 +40,13 @@ jobs:
             --exclude='node_modules' \
             --exclude='.env' \
             --exclude='baileys_auth_info' \
-            -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198" \
+            -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22" \
             ./ "$VPS_USER@$VPS_HOST:/var/www/rama_bot/"
           
           echo "2. Install module & Restart PM2 di VPS..."
-          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
             export PATH=$PATH:/usr/local/bin:/usr/bin:~/.npm-global/bin
             cd /var/www/rama_bot
             
@@ -53,7 +55,7 @@ jobs:
             npm run bot:build --if-present
             
             pm2 stop all || true
-            pm2 save
+            pm2 save || true
           ENDSSH
 
       - name: ☸️ Deploy & Rollout Kubernetes (K3s) di VPS
@@ -63,7 +65,7 @@ jobs:
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
         run: |
           echo "3. Menjalankan Orkestrasi Pods Kubernetes (K3s)..."
-          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 20198 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
+          sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
             mkdir -p /var/www/k8s-rama
             cd /var/www/k8s-rama
@@ -81,12 +83,10 @@ jobs:
             selector:
               matchLabels:
                 app: web-dashboard
-                role: bot-engine
             template:
               metadata:
                 labels:
                   app: web-dashboard
-                  role: bot-engine
               spec:
                 enableServiceLinks: false
                 containers:
@@ -151,7 +151,7 @@ jobs:
             name: bot-service
           spec:
             selector:
-              role: bot-engine
+              app: web-dashboard
             ports:
               - protocol: TCP
                 port: 4000
@@ -186,11 +186,12 @@ jobs:
                         number: 80
           EOF
 
-            kubectl apply -f deployment.yaml
+            kubectl apply -f deployment.yaml || (kubectl delete -f deployment.yaml && kubectl apply -f deployment.yaml)
             kubectl apply -f service.yaml
             kubectl apply -f ingress.yaml
             kubectl rollout restart deployment/web-dashboard
             sleep 8
-            kubectl get pods -o wide
-            kubectl get svc
+            kubectl get pods -l app=web-dashboard -o wide
+            kubectl get svc web-service bot-service
+            kubectl get ingress rama-ingress
           ENDK8S

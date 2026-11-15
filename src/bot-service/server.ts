@@ -57,6 +57,39 @@ function registerBotOutbox(messageId?: string, text?: string) {
   if (text) { const c = text.trim(); recentBotReplies.add(c); setTimeout(() => recentBotReplies.delete(c), 15000); }
 }
 
+// Helper pendeteksi nominal uang otomatis (contoh: Rp 50.000, 50.000, 50000, 50rb, 50k)
+function extractNominalFromText(rawText: string): number | null {
+  if (!rawText) return null;
+  const cleaned = rawText.replace(/[,_]\d{2}\b/g, "");
+
+  // 1. Cek format singkatan seperti 25rb, 25ribu, 25k, 12.5k
+  const shortMatch = cleaned.match(/(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(?:rb|ribu|k)\b/i);
+  if (shortMatch) {
+    const val = parseFloat(shortMatch[1].replace(",", ".")) * 1000;
+    if (val >= 1000) return Math.round(val);
+  }
+
+  // 2. Cek format ribuan dengan titik/koma seperti Rp 50.000 atau 150.000
+  const formattedMatch = cleaned.match(/(?:rp\.?|idr)?\s*(\d{1,3}(?:[.,]\d{3})+)\b/i);
+  if (formattedMatch) {
+    const val = parseInt(formattedMatch[1].replace(/[.,]/g, ""), 10);
+    if (val >= 1000) return val;
+  }
+
+  // 3. Cek angka murni (4 sampai 8 digit, contoh: 25000, 100000)
+  const plainMatches = cleaned.match(/\b(\d{4,8})\b/g);
+  if (plainMatches) {
+    for (const numStr of plainMatches) {
+      const val = parseInt(numStr, 10);
+      if (val >= 1000 && (val < 2020 || val > 2035)) {
+        return val;
+      }
+    }
+  }
+
+  return null;
+}
+
 function getDynamicGreetingAndDate() {
   const now = new Date();
   const hour = now.getHours();
@@ -200,7 +233,7 @@ async function startWhatsApp() {
       let isAutoRejectActive = true;
       try {
         const config = await prisma.botConfig.findUnique({ where: { id: "default-config" } });
-        if (config) isAutoRejectActive = config.isAutoRejectCalls;
+        if (config) isAutoRejectActive = config.isAutoRejectActive ?? config.isAutoRejectCalls;
       } catch (e) {}
 
       for (const call of calls) {
@@ -262,7 +295,7 @@ async function startWhatsApp() {
         // =========================================================================
         // FITUR TAMBAHAN: ADMIN REPLY BUKTI TRANSFER DENGAN KATA "PROSES"
         // =========================================================================
-        if (msg.key.fromMe && text.toLowerCase() === "proses") {
+        if (msg.key.fromMe && /^proses(\b|\s)/i.test(text)) {
           const quotedInfo = msg.message.extendedTextMessage?.contextInfo;
           const quotedMsg = quotedInfo?.quotedMessage;
 
@@ -272,19 +305,27 @@ async function startWhatsApp() {
               quotedMsg.conversation ||
               quotedMsg.extendedTextMessage?.text ||
               quotedMsg.imageMessage?.caption ||
+              quotedMsg.documentMessage?.caption ||
               ""
             ).toLowerCase();
 
+            // Dapatkan nomor WA pelanggan dari quoted context
+            const targetJid = quotedInfo?.participant || remoteJid;
+            const targetPhone = targetJid.split("@")[0].split(":")[0];
+
             let matchedProduct: any = null;
-            let finalPrice = 25000; // Nilai default bila tidak terdeteksi
+            let finalPrice = 0;
             let finalName = "Layanan Premium";
 
+            // 1. Cek apakah ada produk yang cocok dari teks/caption atau harga di database
+            let allProducts: any[] = [];
             try {
-              const allProducts = await prisma.product.findMany();
+              allProducts = await prisma.product.findMany();
               for (const p of allProducts) {
                 if (
-                  (p.sku && quotedContent.includes(p.sku.toLowerCase())) ||
-                  quotedContent.includes(p.name.toLowerCase())
+                  (p.sku && (quotedContent.includes(p.sku.toLowerCase()) || text.toLowerCase().includes(p.sku.toLowerCase()))) ||
+                  quotedContent.includes(p.name.toLowerCase()) ||
+                  text.toLowerCase().includes(p.name.toLowerCase())
                 ) {
                   matchedProduct = p;
                   finalPrice = Number(p.price);
@@ -294,49 +335,127 @@ async function startWhatsApp() {
               }
             } catch (e) {}
 
-            // Fallback pencocokan keyword bila belum ada di tabel Product
+            // 2. Fallback pencocokan keyword bila belum ada di tabel Product
+            const combinedSearchText = `${text.toLowerCase()} ${quotedContent}`;
             if (!matchedProduct) {
-              if (quotedContent.includes("capcut")) { finalName = "CapCut Pro"; finalPrice = 25000; }
-              else if (quotedContent.includes("netflix")) { finalName = "Netflix Premium"; finalPrice = 40000; }
-              else if (quotedContent.includes("canva")) { finalName = "Canva Pro"; finalPrice = 15000; }
-              else if (quotedContent.includes("bot") || quotedContent.includes("web")) { finalName = "Jasa Pembuatan Bot/Web"; finalPrice = 100000; }
+              if (combinedSearchText.includes("capcut")) { finalName = "CapCut Pro"; finalPrice = 25000; }
+              else if (combinedSearchText.includes("netflix")) { finalName = "Netflix Premium"; finalPrice = 40000; }
+              else if (combinedSearchText.includes("canva")) { finalName = "Canva Pro"; finalPrice = 15000; }
+              else if (combinedSearchText.includes("bot") || combinedSearchText.includes("web")) { finalName = "Jasa Pembuatan Bot/Web"; finalPrice = 100000; }
             }
 
-            // Dapatkan nomor WA pelanggan dari quoted context
-            const targetJid = quotedInfo?.participant || remoteJid;
-            const targetPhone = targetJid.split("@")[0].split(":")[0];
+            // 3. Cek nominal yang diketik admin (misal: "proses 50000") atau yang tertera di bukti transfer/caption
+            const adminNominal = extractNominalFromText(text);
+            const quotedNominal = extractNominalFromText(quotedContent);
+            const detectedTransferNominal = adminNominal || quotedNominal;
 
             try {
-              // 1. Simpan ke database Customer jika belum ada
+              // 4. Simpan/ambil data Customer terlebih dahulu
               const customerRecord = await prisma.customer.upsert({
                 where: { phone: targetPhone },
                 update: {},
                 create: { phone: targetPhone, name: "Pelanggan Rama Store", isBlocked: false }
               });
 
-              // 2. Buat record Order / Pesanan
-              const orderNum = `RS-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
-              await prisma.order.create({
-                data: {
-                  orderNumber: orderNum,
-                  customerId: customerRecord.id,
-                  subtotal: finalPrice,
-                  totalAmount: finalPrice,
-                  status: "PROCESSING",
-                  customerNotes: `Bukti transfer diverifikasi admin (${finalName})`,
-                  items: matchedProduct ? {
-                    create: {
-                      productId: matchedProduct.id,
-                      productName: matchedProduct.name,
-                      unitPrice: finalPrice,
-                      quantity: 1,
-                      subtotal: finalPrice
-                    }
-                  } : undefined
-                }
+              // 5. Cek apakah pelanggan punya Order berstatus PENDING (dari format ORDER#...)
+              const pendingOrder = await prisma.order.findFirst({
+                where: { customerId: customerRecord.id, status: "PENDING" },
+                orderBy: { createdAt: "desc" },
+                include: { items: true }
               });
 
-              // 3. Catat / Update Omset
+              if (pendingOrder) {
+                if (!matchedProduct && pendingOrder.items && pendingOrder.items.length > 0) {
+                  finalName = pendingOrder.items[0].productName || finalName;
+                }
+                if (finalPrice === 0) {
+                  finalPrice = Number(pendingOrder.totalAmount);
+                }
+              }
+
+              // 6. Jika masih belum ada nominal (karena bukti transfer berupa gambar tanpa caption), cek riwayat chat terakhir
+              if (!detectedTransferNominal && finalPrice === 0) {
+                const lastConv = await prisma.conversation.findFirst({
+                  where: { customerId: customerRecord.id },
+                  orderBy: { lastMessageAt: "desc" }
+                });
+                if (lastConv) {
+                  const recentMsgs = await prisma.message.findMany({
+                    where: { conversationId: lastConv.id },
+                    orderBy: { createdAt: "desc" },
+                    take: 6
+                  });
+                  for (const rMsg of recentMsgs) {
+                    const histText = (rMsg.content || "").toLowerCase();
+                    const histNominal = extractNominalFromText(histText);
+                    for (const p of allProducts) {
+                      if ((p.sku && histText.includes(p.sku.toLowerCase())) || histText.includes(p.name.toLowerCase())) {
+                        matchedProduct = p;
+                        finalName = p.name;
+                        finalPrice = Number(p.price);
+                        break;
+                      }
+                    }
+                    if (histNominal && finalPrice === 0) {
+                      finalPrice = histNominal;
+                    }
+                    if (finalPrice > 0) break;
+                  }
+                }
+              }
+
+              // 7. Prioritaskan nominal asli yang ditransfer jika terdeteksi pada pesan/bukti transfer
+              if (detectedTransferNominal && detectedTransferNominal > 0) {
+                finalPrice = detectedTransferNominal;
+                if (!matchedProduct) {
+                  const prodByPrice = allProducts.find((p: any) => Number(p.price) === detectedTransferNominal);
+                  if (prodByPrice) {
+                    matchedProduct = prodByPrice;
+                    finalName = prodByPrice.name;
+                  }
+                }
+              }
+
+              // Nilai fallback paling akhir jika sama sekali tidak ada nominal di mana pun
+              if (finalPrice <= 0) {
+                finalPrice = 25000;
+              }
+
+              // 8. Update Order PENDING jika sudah ada, atau buat Order baru sesuai nominal transfer
+              if (pendingOrder) {
+                await prisma.order.update({
+                  where: { id: pendingOrder.id },
+                  data: {
+                    subtotal: finalPrice,
+                    totalAmount: finalPrice,
+                    status: "PROCESSING",
+                    customerNotes: `${pendingOrder.customerNotes || ""} | Bukti transfer diverifikasi admin (Rp ${finalPrice.toLocaleString("id-ID")})`
+                  }
+                });
+              } else {
+                const orderNum = `RS-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
+                await prisma.order.create({
+                  data: {
+                    orderNumber: orderNum,
+                    customerId: customerRecord.id,
+                    subtotal: finalPrice,
+                    totalAmount: finalPrice,
+                    status: "PROCESSING",
+                    customerNotes: `Bukti transfer diverifikasi admin (${finalName} - Rp ${finalPrice.toLocaleString("id-ID")})`,
+                    items: matchedProduct ? {
+                      create: {
+                        productId: matchedProduct.id,
+                        productName: matchedProduct.name,
+                        unitPrice: finalPrice,
+                        quantity: 1,
+                        subtotal: finalPrice
+                      }
+                    } : undefined
+                  }
+                });
+              }
+
+              // 9. Catat / Update Omset sesuai nominal yang ditransfer
               const todayDate = new Date();
               todayDate.setHours(0, 0, 0, 0);
 
@@ -350,7 +469,7 @@ async function startWhatsApp() {
                 }
               } catch (omsetErr) {}
 
-              // 4. Balas otomatis: Transaksi Sedang Diproses
+              // 10. Balas otomatis: Transaksi Sedang Diproses sesuai nominal
               const prosesText = `⏳ *TRANSAKSI SEDANG DIPROSES*
 
 Halo Kak! Bukti pembayaran telah kami terima dan diverifikasi.
