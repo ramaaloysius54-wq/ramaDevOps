@@ -26,15 +26,15 @@ jobs:
           npm run build --if-present
           npm run bot:build --if-present
 
-      - name: 🚀 Sync & Restart di VPS (/var/www/rama_bot)
+      - name: 🚀 Sync & Build di VPS (/var/www/rama_bot)
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
         run: |
           sudo apt-get update && sudo apt-get install -y sshpass rsync
-          
-          echo "1. Mengirim file terbaru ke VPS..."
+
+          echo "1. Mengirim file terbaru (termasuk folder k8s/) ke VPS..."
           sshpass -e rsync -avz \
             --exclude='.git' \
             --exclude='node_modules' \
@@ -42,155 +42,55 @@ jobs:
             --exclude='baileys_auth_info' \
             -e "ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22" \
             ./ "$VPS_USER@$VPS_HOST:/var/www/rama_bot/"
-          
-          echo "2. Install module & Restart PM2 di VPS..."
+
+          echo "2. Install module & Build Bot di VPS..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" << 'ENDSSH'
             export NVM_DIR="$HOME/.nvm"
             [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
             export PATH=$PATH:/usr/local/bin:/usr/bin:~/.npm-global/bin
             cd /var/www/rama_bot
-            
+
             npm ci
             npx prisma generate
             npm run bot:build --if-present
-            
+
             pm2 stop all || true
             pm2 save || true
           ENDSSH
 
-      - name: ☸️ Deploy & Rollout Kubernetes (K3s) di VPS
+      - name: ☸️ Auto-Sync ArgoCD & Rollout K3s (/var/www/rama_bot/k8s)
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           SSHPASS: ${{ secrets.VPS_PASSWORD }}
         run: |
-          echo "3. Menjalankan Orkestrasi Pods Kubernetes (K3s)..."
+          echo "3. Menjalankan Auto-Sync ArgoCD & Rollout Pods K3s..."
           sshpass -e ssh -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -p 22 "$VPS_USER@$VPS_HOST" << 'ENDK8S'
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-            mkdir -p /var/www/k8s-rama
-            cd /var/www/k8s-rama
+
+           
 
             # Hapus deployment bot-engine lama yang terpisah agar tidak bentrok sesi WA
             kubectl delete deployment bot-engine --ignore-not-found=true
 
-            cat << 'EOF' > deployment.yaml
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: web-dashboard
-          spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: web-dashboard
-            template:
-              metadata:
-                labels:
-                  app: web-dashboard
-              spec:
-                enableServiceLinks: false
-                containers:
-                - name: web
-                  image: node:20
-                  workingDir: /app
-                  command: ["sh", "-c", "npm run start"]
-                  ports:
-                  - containerPort: 3000
-                  env:
-                  - name: HOSTNAME
-                    value: "0.0.0.0"
-                  - name: HOST
-                    value: "0.0.0.0"
-                  - name: PORT
-                    value: "3000"
-                  - name: BOT_SERVICE_PORT
-                    value: "4000"
-                  - name: BOT_PORT
-                    value: "4000"
-                  volumeMounts:
-                  - name: app-volume
-                    mountPath: /app
-                - name: engine
-                  image: node:20
-                  workingDir: /app
-                  command: ["sh", "-c", "npm run bot:build && (node dist-bot/server.js || node dist-bot/bot-service/server.js)"]
-                  ports:
-                  - containerPort: 4000
-                  env:
-                  - name: PORT
-                    value: "4000"
-                  - name: BOT_SERVICE_PORT
-                    value: "4000"
-                  volumeMounts:
-                  - name: app-volume
-                    mountPath: /app
-                volumes:
-                - name: app-volume
-                  hostPath:
-                    path: /var/www/rama_bot
-          EOF
+            # Masuk ke folder k8s utama di dalam project rama_bot
+            cd /var/www/rama_bot/k8s
 
-            cat << 'EOF' > service.yaml
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: web-service
-          spec:
-            type: NodePort
-            selector:
-              app: web-dashboard
-            ports:
-              - protocol: TCP
-                port: 80
-                targetPort: 3000
-                nodePort: 30080
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: bot-service
-          spec:
-            selector:
-              app: web-dashboard
-            ports:
-              - protocol: TCP
-                port: 4000
-                targetPort: 4000
-          EOF
-
-            cat << 'EOF' > ingress.yaml
-          apiVersion: networking.k8s.io/v1
-          kind: Ingress
-          metadata:
-            name: rama-ingress
-            annotations:
-              ingress.kubernetes.io/ssl-redirect: "false"
-          spec:
-            rules:
-            - host: tabunganrama.my.id
-              http:
-                paths:
-                - path: /api/bot
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: bot-service
-                      port:
-                        number: 4000
-                - path: /
-                  pathType: Prefix
-                  backend:
-                    service:
-                      name: web-service
-                      port:
-                        number: 80
-          EOF
-
-            kubectl apply -f deployment.yaml || (kubectl delete -f deployment.yaml && kubectl apply -f deployment.yaml)
+            # Terapkan konfigurasi ArgoCD Application & manifest dari folder k8s/
+            kubectl apply -f app-ramabot.yaml
             kubectl apply -f service.yaml
             kubectl apply -f ingress.yaml
+            kubectl apply -f deployment.yaml || (kubectl delete -f deployment.yaml && kubectl apply -f deployment.yaml)
+
+            # Pastikan fitur Auto-Sync & Self-Heal ArgoCD selalu aktif
+            kubectl patch application rama-bot-gitops -n argocd --type merge -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' || true
+            kubectl annotate application rama-bot-gitops -n argocd argocd.argoproj.io/refresh="hard" --overwrite || true
+
+            # Restart deployment agar pod memuat hasil build terbaru dari /var/www/rama_bot
             kubectl rollout restart deployment/web-dashboard
             sleep 8
+
+            kubectl get applications -n argocd
             kubectl get pods -l app=web-dashboard -o wide
             kubectl get svc web-service bot-service
             kubectl get ingress rama-ingress

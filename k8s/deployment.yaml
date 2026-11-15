@@ -7,12 +7,10 @@ spec:
   selector:
     matchLabels:
       app: web-dashboard
-      role: bot-engine
   template:
     metadata:
       labels:
         app: web-dashboard
-        role: bot-engine
     spec:
       enableServiceLinks: false
       containers:
