@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-dashboard
+  template:
+    metadata:
+      labels:
+        app: web-dashboard
+    spec:
+      enableServiceLinks: false
+      containers:
+      - name: web
+        image: node:20
+        workingDir: /app
+        command: ["sh", "-c", "npm run start"]
+        ports:
+        - containerPort: 3000
+        env:
+        - name: HOSTNAME
+          value: "0.0.0.0"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "3000"
+        - name: BOT_SERVICE_PORT
+          value: "4000"
+        - name: BOT_PORT
+          value: "4000"
+        volumeMounts:
+        - name: app-volume
+          mountPath: /app
+      - name: engine
+        image: node:20
+        workingDir: /app
+        command: ["sh", "-c", "npm run bot:build && (node dist-bot/server.js || node dist-bot/bot-service/server.js)"]
+        ports:
+        - containerPort: 4000
+        env:
+        - name: PORT
+          value: "4000"
+        - name: BOT_SERVICE_PORT
+          value: "4000"
+        volumeMounts:
+        - name: app-volume
+          mountPath: /app
+      volumes:
+      - name: app-volume
+        hostPath:
+          path: /var/www/rama_bot
