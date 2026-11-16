@@ -31,13 +31,17 @@ spec:
           value: "4000"
         - name: BOT_PORT
           value: "4000"
+        envFrom:
+        - secretRef:
+            name: ramabot-secrets
+            optional: true
         volumeMounts:
         - name: app-volume
           mountPath: /app
       - name: engine
         image: node:20
         workingDir: /app
-        command: ["sh", "-c", "npm run bot:build && (node dist-bot/server.js || node dist-bot/bot-service/server.js)"]
+        command: ["sh", "-c", "npm run bot:build && node dist-bot/bot-service/server.js"]
         ports:
         - containerPort: 4000
         env:
@@ -45,6 +49,10 @@ spec:
           value: "4000"
         - name: BOT_SERVICE_PORT
           value: "4000"
+        envFrom:
+        - secretRef:
+            name: ramabot-secrets
+            optional: true
         volumeMounts:
         - name: app-volume
           mountPath: /app
