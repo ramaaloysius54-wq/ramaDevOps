@@ -203,6 +203,11 @@ async function startWhatsApp() {
           currentStatus = "DISCONNECTED";
           currentQrDataUrl = null;
           currentPhone = null;
+          await prisma.whatsappConnection.upsert({
+            where: { sessionId: "primary" },
+            update: { status: ConnectionStatus.DISCONNECTED, phone: null },
+            create: { sessionId: "primary", status: ConnectionStatus.DISCONNECTED, phone: null },
+          }).catch(() => {});
           io.emit("whatsapp:status", { status: "DISCONNECTED", phone: null });
           setTimeout(startWhatsApp, 1500);
         } else {
@@ -219,18 +224,19 @@ async function startWhatsApp() {
         currentPhone = botJid.split(":")[0] || botJid.split("@")[0];
         
         myLogger.info(`WhatsApp Bot Terhubung 24/7 ke nomor: +${currentPhone}`);
-        prisma.whatsappConnection.upsert({
+        await prisma.whatsappConnection.upsert({
           where: { sessionId: "primary" },
           update: { status: ConnectionStatus.CONNECTED, phone: currentPhone, lastActive: new Date() },
           create: { sessionId: "primary", status: ConnectionStatus.CONNECTED, phone: currentPhone },
         }).catch(() => {});
         
         io.emit("whatsapp:status", { status: "CONNECTED", phone: currentPhone });
+        io.emit("dashboard:stats_update");
       }
     });
 
     sock.ev.on("call", async (calls: any[]) => {
-     let isAutoRejectActive = true;
+      let isAutoRejectActive = true;
       try {
         const config = await prisma.botConfig.findUnique({ where: { id: "default-config" } });
         if (config) isAutoRejectActive = config.isAutoRejectCalls;
@@ -271,7 +277,7 @@ async function startWhatsApp() {
     });
 
     sock.ev.on("messages.upsert", async (m: any) => {
-      if (m.type !== "notify") return;
+      if (m.type !== "notify" && m.type !== "append") return;
 
       let isGlobalBotEnabled = true;
       try {
@@ -283,145 +289,183 @@ async function startWhatsApp() {
 
       for (const msg of m.messages) {
         if (!msg.message) continue;
+        if (m.type === "append" && !msg.key?.fromMe) continue;
         if (msg.key?.id) cacheMessage(msg.key.id, msg.message);
 
-        const remoteJid = msg.key.remoteJid;
+        // Unwrap pesan bila berasal dari HP utama (deviceSentMessage), pesan sementara (ephemeral), atau viewOnce
+        const unwrappedMsg =
+          msg.message.deviceSentMessage?.message ||
+          msg.message.ephemeralMessage?.message ||
+          msg.message.viewOnceMessage?.message ||
+          msg.message.viewOnceMessageV2?.message ||
+          msg.message.viewOnceMessageV2Extension?.message ||
+          msg.message.documentWithCaptionMessage?.message ||
+          msg.message;
+
+        const remoteJid = msg.key.remoteJid || msg.message.deviceSentMessage?.destinationJid;
         if (!remoteJid || remoteJid === "status@broadcast") continue;
         if (msg.key.id && botSentMessageIds.has(msg.key.id)) continue;
 
-        const text = (msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim();
-        if (!text) continue;
+        const hasMedia = Boolean(unwrappedMsg?.imageMessage || unwrappedMsg?.documentMessage || unwrappedMsg?.videoMessage);
+        const text = (
+          unwrappedMsg?.conversation ||
+          unwrappedMsg?.extendedTextMessage?.text ||
+          unwrappedMsg?.imageMessage?.caption ||
+          unwrappedMsg?.documentMessage?.caption ||
+          unwrappedMsg?.videoMessage?.caption ||
+          ""
+        ).trim();
+
+        if (!text && !hasMedia) continue;
 
         // =========================================================================
         // FITUR TAMBAHAN: ADMIN REPLY BUKTI TRANSFER DENGAN KATA "PROSES"
         // =========================================================================
-        if (msg.key.fromMe && /^proses(\b|\s)/i.test(text)) {
-          const quotedInfo = msg.message.extendedTextMessage?.contextInfo;
-          const quotedMsg = quotedInfo?.quotedMessage;
+        if (msg.key.fromMe && /^[.!]?proses(\b|\s|$)/i.test(text)) {
+          const quotedInfo =
+            unwrappedMsg?.extendedTextMessage?.contextInfo ||
+            unwrappedMsg?.imageMessage?.contextInfo ||
+            unwrappedMsg?.documentMessage?.contextInfo ||
+            msg.message?.extendedTextMessage?.contextInfo;
 
-          if (quotedMsg) {
-            // Ambil teks baik dari percakapan teks biasa, extended, atau caption gambar bukti transfer
-            const quotedContent = (
-              quotedMsg.conversation ||
-              quotedMsg.extendedTextMessage?.text ||
-              quotedMsg.imageMessage?.caption ||
-              quotedMsg.documentMessage?.caption ||
-              ""
-            ).toLowerCase();
+          const rawQuotedMsg = quotedInfo?.quotedMessage;
+          const quotedMsg =
+            rawQuotedMsg?.ephemeralMessage?.message ||
+            rawQuotedMsg?.viewOnceMessage?.message ||
+            rawQuotedMsg?.viewOnceMessageV2?.message ||
+            rawQuotedMsg?.viewOnceMessageV2Extension?.message ||
+            rawQuotedMsg?.documentWithCaptionMessage?.message ||
+            rawQuotedMsg;
 
-            // Dapatkan nomor WA pelanggan dari quoted context
-            const targetJid = quotedInfo?.participant || remoteJid;
-            const targetPhone = targetJid.split("@")[0].split(":")[0];
+          // Ambil teks baik dari percakapan teks biasa, extended, atau caption gambar bukti transfer
+          const quotedContent = (
+            quotedMsg?.conversation ||
+            quotedMsg?.extendedTextMessage?.text ||
+            quotedMsg?.imageMessage?.caption ||
+            quotedMsg?.documentMessage?.caption ||
+            ""
+          ).toLowerCase();
 
-            let matchedProduct: any = null;
-            let finalPrice = 0;
-            let finalName = "Layanan Premium";
+          // Dapatkan nomor WA pelanggan (jika di grup gunakan participant, jika chat pribadi gunakan remoteJid pelanggan)
+          const resolvedJid = remoteJid.endsWith("@g.us")
+            ? (quotedInfo?.participant || remoteJid)
+            : ((msg.key as any).remoteJidAlt || (msg.key as any).senderPn || remoteJid);
+          const targetPhone = resolvedJid.split("@")[0].split(":")[0];
 
-            // 1. Cek apakah ada produk yang cocok dari teks/caption atau harga di database
-            let allProducts: any[] = [];
-            try {
-              allProducts = await prisma.product.findMany();
-              for (const p of allProducts) {
-                if (
-                  (p.sku && (quotedContent.includes(p.sku.toLowerCase()) || text.toLowerCase().includes(p.sku.toLowerCase()))) ||
-                  quotedContent.includes(p.name.toLowerCase()) ||
-                  text.toLowerCase().includes(p.name.toLowerCase())
-                ) {
-                  matchedProduct = p;
-                  finalPrice = Number(p.price);
-                  finalName = p.name;
-                  break;
-                }
+          let matchedProduct: any = null;
+          let finalPrice = 0;
+          let finalName = "Layanan Premium";
+
+          // 1. Cek apakah ada produk yang cocok dari teks/caption atau harga di database
+          let allProducts: any[] = [];
+          try {
+            allProducts = await prisma.product.findMany();
+            for (const p of allProducts) {
+              if (
+                (p.sku && (quotedContent.includes(p.sku.toLowerCase()) || text.toLowerCase().includes(p.sku.toLowerCase()))) ||
+                quotedContent.includes(p.name.toLowerCase()) ||
+                text.toLowerCase().includes(p.name.toLowerCase())
+              ) {
+                matchedProduct = p;
+                finalPrice = Number(p.price);
+                finalName = p.name;
+                break;
               }
-            } catch (e) {}
+            }
+          } catch (e) {}
 
-            // 2. Fallback pencocokan keyword bila belum ada di tabel Product
-            const combinedSearchText = `${text.toLowerCase()} ${quotedContent}`;
-            if (!matchedProduct) {
-              if (combinedSearchText.includes("capcut")) { finalName = "CapCut Pro"; finalPrice = 25000; }
-              else if (combinedSearchText.includes("netflix")) { finalName = "Netflix Premium"; finalPrice = 40000; }
-              else if (combinedSearchText.includes("canva")) { finalName = "Canva Pro"; finalPrice = 15000; }
-              else if (combinedSearchText.includes("bot") || combinedSearchText.includes("web")) { finalName = "Jasa Pembuatan Bot/Web"; finalPrice = 100000; }
+          // 2. Fallback pencocokan keyword bila belum ada di tabel Product
+          const combinedSearchText = `${text.toLowerCase()} ${quotedContent}`;
+          if (!matchedProduct) {
+            if (combinedSearchText.includes("capcut")) { finalName = "CapCut Pro"; finalPrice = 25000; }
+            else if (combinedSearchText.includes("netflix")) { finalName = "Netflix Premium"; finalPrice = 40000; }
+            else if (combinedSearchText.includes("canva")) { finalName = "Canva Pro"; finalPrice = 15000; }
+            else if (combinedSearchText.includes("bot") || combinedSearchText.includes("web")) { finalName = "Jasa Pembuatan Bot/Web"; finalPrice = 100000; }
+          }
+
+          // 3. Cek nominal yang diketik admin (misal: "proses 50000") atau yang tertera di bukti transfer/caption
+          const adminNominal = extractNominalFromText(text);
+          const quotedNominal = extractNominalFromText(quotedContent);
+          const detectedTransferNominal = adminNominal || quotedNominal;
+
+          try {
+            // 4. Simpan/ambil data Customer terlebih dahulu
+            const customerRecord = await prisma.customer.upsert({
+              where: { phone: targetPhone },
+              update: {},
+              create: { phone: targetPhone, name: "Pelanggan Rama Store", isBlocked: false }
+            });
+
+            let convRecord = await prisma.conversation.findFirst({
+              where: { customerId: customerRecord.id, isArchived: false },
+              orderBy: { lastMessageAt: "desc" }
+            });
+            if (!convRecord) {
+              convRecord = await prisma.conversation.create({
+                data: { customerId: customerRecord.id, isBotActive: true, unreadCount: 0 }
+              });
             }
 
-            // 3. Cek nominal yang diketik admin (misal: "proses 50000") atau yang tertera di bukti transfer/caption
-            const adminNominal = extractNominalFromText(text);
-            const quotedNominal = extractNominalFromText(quotedContent);
-            const detectedTransferNominal = adminNominal || quotedNominal;
+            // 5. Cek apakah pelanggan punya Order berstatus PENDING (dari format ORDER#...)
+            const pendingOrder = await prisma.order.findFirst({
+              where: { customerId: customerRecord.id, status: "PENDING" },
+              orderBy: { createdAt: "desc" },
+              include: { items: true }
+            });
 
-            try {
-              // 4. Simpan/ambil data Customer terlebih dahulu
-              const customerRecord = await prisma.customer.upsert({
-                where: { phone: targetPhone },
-                update: {},
-                create: { phone: targetPhone, name: "Pelanggan Rama Store", isBlocked: false }
-              });
+            if (pendingOrder) {
+              if (!matchedProduct && pendingOrder.items && pendingOrder.items.length > 0) {
+                finalName = pendingOrder.items[0].productName || finalName;
+              }
+              if (finalPrice === 0) {
+                finalPrice = Number(pendingOrder.totalAmount);
+              }
+            }
 
-              // 5. Cek apakah pelanggan punya Order berstatus PENDING (dari format ORDER#...)
-              const pendingOrder = await prisma.order.findFirst({
-                where: { customerId: customerRecord.id, status: "PENDING" },
+            // 6. Jika masih belum ada nominal (karena bukti transfer berupa gambar tanpa caption), cek riwayat chat terakhir
+            if (!detectedTransferNominal && finalPrice === 0) {
+              const recentMsgs = await prisma.message.findMany({
+                where: { conversationId: convRecord.id },
                 orderBy: { createdAt: "desc" },
-                include: { items: true }
+                take: 6
               });
-
-              if (pendingOrder) {
-                if (!matchedProduct && pendingOrder.items && pendingOrder.items.length > 0) {
-                  finalName = pendingOrder.items[0].productName || finalName;
-                }
-                if (finalPrice === 0) {
-                  finalPrice = Number(pendingOrder.totalAmount);
-                }
-              }
-
-              // 6. Jika masih belum ada nominal (karena bukti transfer berupa gambar tanpa caption), cek riwayat chat terakhir
-              if (!detectedTransferNominal && finalPrice === 0) {
-                const lastConv = await prisma.conversation.findFirst({
-                  where: { customerId: customerRecord.id },
-                  orderBy: { lastMessageAt: "desc" }
-                });
-                if (lastConv) {
-                  const recentMsgs = await prisma.message.findMany({
-                    where: { conversationId: lastConv.id },
-                    orderBy: { createdAt: "desc" },
-                    take: 6
-                  });
-                  for (const rMsg of recentMsgs) {
-                    const histText = (rMsg.content || "").toLowerCase();
-                    const histNominal = extractNominalFromText(histText);
-                    for (const p of allProducts) {
-                      if ((p.sku && histText.includes(p.sku.toLowerCase())) || histText.includes(p.name.toLowerCase())) {
-                        matchedProduct = p;
-                        finalName = p.name;
-                        finalPrice = Number(p.price);
-                        break;
-                      }
-                    }
-                    if (histNominal && finalPrice === 0) {
-                      finalPrice = histNominal;
-                    }
-                    if (finalPrice > 0) break;
+              for (const rMsg of recentMsgs) {
+                const histText = (rMsg.content || "").toLowerCase();
+                const histNominal = extractNominalFromText(histText);
+                for (const p of allProducts) {
+                  if ((p.sku && histText.includes(p.sku.toLowerCase())) || histText.includes(p.name.toLowerCase())) {
+                    matchedProduct = p;
+                    finalName = p.name;
+                    finalPrice = Number(p.price);
+                    break;
                   }
                 }
+                if (histNominal && finalPrice === 0) {
+                  finalPrice = histNominal;
+                }
+                if (finalPrice > 0) break;
               }
+            }
 
-              // 7. Prioritaskan nominal asli yang ditransfer jika terdeteksi pada pesan/bukti transfer
-              if (detectedTransferNominal && detectedTransferNominal > 0) {
-                finalPrice = detectedTransferNominal;
-                if (!matchedProduct) {
-                  const prodByPrice = allProducts.find((p: any) => Number(p.price) === detectedTransferNominal);
-                  if (prodByPrice) {
-                    matchedProduct = prodByPrice;
-                    finalName = prodByPrice.name;
-                  }
+            // 7. Prioritaskan nominal asli yang ditransfer jika terdeteksi pada pesan/bukti transfer
+            if (detectedTransferNominal && detectedTransferNominal > 0) {
+              finalPrice = detectedTransferNominal;
+              if (!matchedProduct) {
+                const prodByPrice = allProducts.find((p: any) => Number(p.price) === detectedTransferNominal);
+                if (prodByPrice) {
+                  matchedProduct = prodByPrice;
+                  finalName = prodByPrice.name;
                 }
               }
+            }
 
-              // Nilai fallback paling akhir jika sama sekali tidak ada nominal di mana pun
-              if (finalPrice <= 0) {
-                finalPrice = 25000;
-              }
+            // Nilai fallback paling akhir jika sama sekali tidak ada nominal di mana pun
+            if (finalPrice <= 0) {
+              finalPrice = 25000;
+            }
 
-              // 8. Update Order PENDING jika sudah ada, atau buat Order baru sesuai nominal transfer
+            // 8. Update Order PENDING jika sudah ada, atau buat Order baru sesuai nominal transfer
+            try {
               if (pendingOrder) {
                 await prisma.order.update({
                   where: { id: pendingOrder.id },
@@ -454,23 +498,26 @@ async function startWhatsApp() {
                   }
                 });
               }
+            } catch (orderErr) {
+              console.error("Gagal menyimpan order:", orderErr);
+            }
 
-              // 9. Catat / Update Omset sesuai nominal yang ditransfer
-              const todayDate = new Date();
-              todayDate.setHours(0, 0, 0, 0);
+            // 9. Catat / Update Omset sesuai nominal yang ditransfer
+            const todayDate = new Date();
+            todayDate.setHours(0, 0, 0, 0);
 
-              try {
-                if ((prisma as any).omset) {
-                  await (prisma as any).omset.upsert({
-                    where: { tanggal: todayDate },
-                    update: { total: { increment: finalPrice } },
-                    create: { tanggal: todayDate, total: finalPrice }
-                  });
-                }
-              } catch (omsetErr) {}
+            try {
+              if ((prisma as any).omset) {
+                await (prisma as any).omset.upsert({
+                  where: { tanggal: todayDate },
+                  update: { total: { increment: finalPrice } },
+                  create: { tanggal: todayDate, total: finalPrice }
+                });
+              }
+            } catch (omsetErr) {}
 
-              // 10. Balas otomatis: Transaksi Sedang Diproses sesuai nominal
-              const prosesText = `⏳ *TRANSAKSI SEDANG DIPROSES*
+            // 10. Balas otomatis: Transaksi Sedang Diproses sesuai nominal
+            const prosesText = `⏳ *TRANSAKSI SEDANG DIPROSES*
 
 Halo Kak! Bukti pembayaran telah kami terima dan diverifikasi.
 
@@ -480,21 +527,45 @@ Status: *SEDANG DIPROSES* ⚙️
 
 Pesanan/akun Anda sedang disiapkan oleh admin. Mohon ditunggu 5-10 menit, ya!`;
 
-              await sendTextMessage(remoteJid, null, prosesText);
-              io.emit("dashboard:stats_update");
-            } catch (err) {
-              console.error("Gagal memproses pesanan otomatis:", err);
-            }
-            continue; // Lanjut ke pesan berikutnya
+            await sendTextMessage(remoteJid, convRecord.id, prosesText);
+            io.emit("dashboard:stats_update");
+          } catch (err) {
+            console.error("Gagal memproses pesanan otomatis:", err);
           }
+          continue; // Lanjut ke pesan berikutnya
         }
         // =========================================================================
 
-        if (msg.key.fromMe && recentBotReplies.has(text)) continue;
+        if (msg.key.fromMe) {
+          if (recentBotReplies.has(text)) continue;
+          // Catat pesan manual dari admin ke database agar tampil real-time di dashboard
+          const targetChatJid = (msg.key as any).remoteJidAlt || (msg.key as any).senderPn || remoteJid;
+          const targetChatPhone = targetChatJid.split("@")[0].split(":")[0];
+          try {
+            const cust = await prisma.customer.findUnique({ where: { phone: targetChatPhone } });
+            if (cust) {
+              const conv = await prisma.conversation.findFirst({ where: { customerId: cust.id, isArchived: false } });
+              if (conv && text) {
+                await prisma.message.create({
+                  data: { conversationId: conv.id, senderType: "BOT", type: "TEXT", content: text, waMessageId: msg.key.id || undefined, status: "SENT" }
+                }).catch(() => {});
+                await prisma.conversation.update({
+                  where: { id: conv.id },
+                  data: { lastMessageAt: new Date() }
+                }).catch(() => {});
+                io.emit("message:outgoing", { conversationId: conv.id });
+                io.emit("dashboard:stats_update");
+              }
+            }
+          } catch (e) {}
+          continue;
+        }
 
-        const senderPhone = remoteJid.split("@")[0].split(":")[0];
+        const resolvedSenderJid = (msg.key as any).remoteJidAlt || (msg.key as any).senderPn || remoteJid;
+        const senderPhone = resolvedSenderJid.split("@")[0].split(":")[0];
         const customerName = msg.pushName || "Sobat Premium";
-        handleIncomingMessage(remoteJid, senderPhone, customerName, text, msg).catch(() => {});
+        const effectiveText = text || "[Bukti Transfer / Media]";
+        handleIncomingMessage(remoteJid, senderPhone, customerName, effectiveText, msg).catch(() => {});
       }
     });
   } catch (error) {
@@ -514,6 +585,12 @@ async function handleIncomingMessage(jid: string, phone: string, name: string, t
     let customer = await prisma.customer.findUnique({ where: { phone } });
 
     if (!customer) {
+      customer = await prisma.customer.create({
+        data: { phone, name, isBlocked: false }
+      }).catch(() => null);
+    }
+
+    if (!customer) {
       const temporaryCustomer = { id: "UNREGISTERED", name, phone, isBlocked: false };
       await processBotAutomations(jid, null, text.trim(), temporaryCustomer);
       return; 
@@ -525,18 +602,18 @@ async function handleIncomingMessage(jid: string, phone: string, name: string, t
     if (!conversation) {
       conversation = await prisma.conversation.create({ data: { customerId: customer.id, isBotActive: true, unreadCount: 1 } });
     } else {
-      prisma.conversation.update({
+      await prisma.conversation.update({
         where: { id: conversation.id },
         data: { lastMessageAt: new Date(), unreadCount: { increment: 1 } }
       }).catch(() => {});
     }
 
-    prisma.message.create({
+    await prisma.message.create({
       data: { conversationId: conversation.id, senderType: "CUSTOMER", type: "TEXT", content: text, waMessageId: rawMsg.key.id || undefined, status: "DELIVERED" },
-    }).then(() => {
-      io.emit("message:incoming", { conversationId: conversation.id }); 
-      io.emit("dashboard:stats_update");
     }).catch(() => {});
+
+    io.emit("message:incoming", { conversationId: conversation.id }); 
+    io.emit("dashboard:stats_update");
 
     if (conversation.isBotActive === false && text.toLowerCase().trim() !== "menu") {
       return;
@@ -553,7 +630,7 @@ async function processBotAutomations(jid: string, convId: string | null, text: s
   // 1. COMMAND: MENU
   if (cleanText === "menu" || cleanText === "premium") {
     if (convId) {
-      prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
+      await prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
     }
     const { greeting, dateStr, timeStr } = getDynamicGreetingAndDate();
     
@@ -584,7 +661,7 @@ Selamat datang di *Rama Store* (Aplikasi Premium Murah).
   // 2. COMMAND: LAYANAN / PRODUK / LIST
   if (cleanText === "layanan" || cleanText === "produk" || cleanText === "list") {
     if (convId) {
-      prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
+      await prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
     }
     
     let keywords: any[] = [];
@@ -661,8 +738,19 @@ Ketik: \`ORDER#WEBSITE#NAMA_BISNIS#FITUR_YANG_DIINGINKAN\``;
       try {
         const base64Data = paymentConfig.qrisBase64.split(",")[1];
         const buffer = Buffer.from(base64Data, "base64");
+        registerBotOutbox(undefined, paymentText);
         const sentImg = await sock.sendMessage(jid, { image: buffer, caption: paymentText });
-        if (sentImg?.key?.id) cacheMessage(sentImg.key.id, sentImg.message);
+        if (sentImg?.key?.id) {
+          registerBotOutbox(sentImg.key.id, paymentText);
+          cacheMessage(sentImg.key.id, sentImg.message);
+        }
+        if (convId) {
+          await prisma.message.create({
+            data: { conversationId: convId, senderType: "BOT", type: "TEXT", content: paymentText, waMessageId: sentImg?.key?.id || undefined, status: "SENT" }
+          }).catch(() => {});
+          io.emit("message:outgoing", { conversationId: convId });
+        }
+        io.emit("dashboard:stats_update");
         return;
       } catch (e) {}
     }
@@ -702,7 +790,7 @@ Ketik: \`ORDER#WEBSITE#NAMA_BISNIS#FITUR_YANG_DIINGINKAN\``;
   // 6. COMMAND: ADMIN
   if (cleanText === "admin" || cleanText === "cs") {
     if (convId) {
-      prisma.conversation.update({
+      await prisma.conversation.update({
         where: { id: convId },
         data: { isBotActive: false },
       }).catch(() => {});
@@ -812,12 +900,15 @@ async function sendTextMessage(jid: string, conversationId: string | null, text:
     }
     
     if (conversationId) {
-      prisma.message.create({ data: { conversationId, senderType: "BOT", type: "TEXT", content: text, waMessageId: sent?.key?.id || undefined, status: "SENT" } })
-        .then(() => {
-          io.emit("message:outgoing", { conversationId }); 
-          io.emit("dashboard:stats_update");
-        })
-        .catch(() => {});
+      await prisma.message.create({
+        data: { conversationId, senderType: "BOT", type: "TEXT", content: text, waMessageId: sent?.key?.id || undefined, status: "SENT" }
+      }).catch(() => {});
+      await prisma.conversation.update({
+        where: { id: conversationId },
+        data: { lastMessageAt: new Date() }
+      }).catch(() => {});
+      io.emit("message:outgoing", { conversationId }); 
+      io.emit("dashboard:stats_update");
     } else {
       io.emit("dashboard:stats_update");
     }
@@ -877,6 +968,13 @@ app.post("/api/internal/disconnect", async (req, res) => {
   currentStatus = "DISCONNECTED";
   currentPairingCode = null;
   currentPhone = null;
+  await prisma.whatsappConnection.upsert({
+    where: { sessionId: "primary" },
+    update: { status: ConnectionStatus.DISCONNECTED, phone: null, pairingCode: null },
+    create: { sessionId: "primary", status: ConnectionStatus.DISCONNECTED, phone: null, pairingCode: null },
+  }).catch(() => {});
+  io.emit("whatsapp:status", { status: "DISCONNECTED", phone: null });
+  io.emit("dashboard:stats_update");
   return res.json({ success: true });
 });
 
