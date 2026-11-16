@@ -16,18 +16,19 @@ import makeWASocket, {
 import QRCode from "qrcode";
 import { PrismaClient, ConnectionStatus } from "@prisma/client";
 import pino from "pino";
-import os from "os";
 
 const prisma = new PrismaClient();
 prisma.$connect().catch(() => {});
-const logger = pino({ level: "fatal" }); 
+const logger = pino({ level: "fatal" });
 const myLogger = pino({ level: "info" });
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] },
+});
 
 let sock: any = null;
 let currentQrDataUrl: string | null = null;
@@ -42,7 +43,6 @@ const recentBotReplies = new Set<string>();
 const callSpamTracker = new Map<string, { count: number }>();
 const msgRetryCounterMap = new Map<string, number>();
 
-// Cache pesan di RAM untuk mencegah "Menunggu pesan ini" saat WhatsApp meminta retry enkripsi
 const messageCache = new Map<string, proto.IMessage>();
 
 function cacheMessage(id?: string | null, message?: proto.IMessage | null) {
@@ -53,30 +53,70 @@ function cacheMessage(id?: string | null, message?: proto.IMessage | null) {
 }
 
 function registerBotOutbox(messageId?: string, text?: string) {
-  if (messageId) { botSentMessageIds.add(messageId); setTimeout(() => botSentMessageIds.delete(messageId), 60000); }
-  if (text) { const c = text.trim(); recentBotReplies.add(c); setTimeout(() => recentBotReplies.delete(c), 15000); }
+  if (messageId) {
+    botSentMessageIds.add(messageId);
+    setTimeout(() => botSentMessageIds.delete(messageId), 60000);
+  }
+  if (text) {
+    const c = text.trim();
+    recentBotReplies.add(c);
+    setTimeout(() => recentBotReplies.delete(c), 15000);
+  }
 }
 
-// Helper pendeteksi nominal uang otomatis (contoh: Rp 50.000, 50.000, 50000, 50rb, 50k)
+function unwrapMessage(msg?: proto.IMessage | null): proto.IMessage | null {
+  if (!msg) return null;
+  if (msg.ephemeralMessage?.message) return unwrapMessage(msg.ephemeralMessage.message);
+  if (msg.viewOnceMessage?.message) return unwrapMessage(msg.viewOnceMessage.message);
+  if (msg.viewOnceMessageV2?.message) return unwrapMessage(msg.viewOnceMessageV2.message);
+  if (msg.documentWithCaptionMessage?.message) return unwrapMessage(msg.documentWithCaptionMessage.message);
+  return msg;
+}
+
+function extractMessageText(rawMessage?: proto.IMessage | null): string {
+  const m = unwrapMessage(rawMessage);
+  if (!m) return "";
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    ""
+  ).trim();
+}
+
+function extractContextInfo(rawMessage?: proto.IMessage | null): proto.IContextInfo | null {
+  const m = unwrapMessage(rawMessage);
+  if (!m) return null;
+  return (
+    m.extendedTextMessage?.contextInfo ||
+    m.imageMessage?.contextInfo ||
+    m.videoMessage?.contextInfo ||
+    m.documentMessage?.contextInfo ||
+    null
+  );
+}
+
 function extractNominalFromText(rawText: string): number | null {
   if (!rawText) return null;
   const cleaned = rawText.replace(/[,_]\d{2}\b/g, "");
 
-  // 1. Cek format singkatan seperti 25rb, 25ribu, 25k, 12.5k
+  // 1. Format singkatan: 25rb, 25ribu, 25k, 12.5k
   const shortMatch = cleaned.match(/(?:rp\.?\s*)?(\d+(?:[.,]\d+)?)\s*(?:rb|ribu|k)\b/i);
   if (shortMatch) {
     const val = parseFloat(shortMatch[1].replace(",", ".")) * 1000;
     if (val >= 1000) return Math.round(val);
   }
 
-  // 2. Cek format ribuan dengan titik/koma seperti Rp 50.000 atau 150.000
+  // 2. Format ribuan dengan titik/koma: Rp 50.000 atau 150.000
   const formattedMatch = cleaned.match(/(?:rp\.?|idr)?\s*(\d{1,3}(?:[.,]\d{3})+)\b/i);
   if (formattedMatch) {
     const val = parseInt(formattedMatch[1].replace(/[.,]/g, ""), 10);
     if (val >= 1000) return val;
   }
 
-  // 3. Cek angka murni (4 sampai 8 digit, contoh: 25000, 100000)
+  // 3. Angka murni (4 sampai 8 digit: 25000, 100000)
   const plainMatches = cleaned.match(/\b(\d{4,8})\b/g);
   if (plainMatches) {
     for (const numStr of plainMatches) {
@@ -90,6 +130,44 @@ function extractNominalFromText(rawText: string): number | null {
   return null;
 }
 
+// Helper pencocokan produk & harga murni dari Database (Tabel Product & BotKeyword Katalog)
+function matchCatalogItemFromText(
+  searchText: string,
+  allProducts: any[],
+  allKeywords: any[]
+): { product: any | null; name: string | null; price: number } {
+  const lower = searchText.toLowerCase();
+
+  // 1. Cek dari tabel Product
+  for (const p of allProducts) {
+    const skuMatch = p.sku && lower.includes(p.sku.toLowerCase());
+    const nameMatch = p.name && lower.includes(p.name.toLowerCase());
+    if (skuMatch || nameMatch) {
+      return { product: p, name: p.name, price: Number(p.price) };
+    }
+  }
+
+  // 2. Cek dari tabel BotKeyword (Menu Katalog) jika produk disimpan di katalog keyword
+  for (const kw of allKeywords) {
+    const cleanKw = kw.keyword.replace(/[^\w\s]/gi, "").trim();
+    if (cleanKw && lower.includes(cleanKw.toLowerCase())) {
+      const kwPrice = extractNominalFromText(kw.response) || 0;
+      const linkedProd = allProducts.find(
+        (p: any) =>
+          p.name?.toLowerCase().includes(cleanKw.toLowerCase()) ||
+          p.sku?.toLowerCase() === cleanKw.toLowerCase()
+      );
+      return {
+        product: linkedProd || null,
+        name: linkedProd ? linkedProd.name : cleanKw.toUpperCase(),
+        price: linkedProd ? Number(linkedProd.price) : kwPrice,
+      };
+    }
+  }
+
+  return { product: null, name: null, price: 0 };
+}
+
 function getDynamicGreetingAndDate() {
   const now = new Date();
   const hour = now.getHours();
@@ -98,8 +176,18 @@ function getDynamicGreetingAndDate() {
   else if (hour >= 15 && hour < 18) greeting = "Sore 🌇";
   else if (hour >= 18 || hour < 3) greeting = "Malam 🌙";
 
-  const dateStr = now.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
-  const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + " WIB";
+  const dateStr = now.toLocaleDateString("id-ID", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+  const timeStr =
+    now.toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+    }) + " WIB";
   return { greeting, dateStr, timeStr };
 }
 
@@ -109,9 +197,9 @@ async function cleanupOldCommands() {
       where: {
         OR: [
           { command: { startsWith: "!" } },
-          { command: { in: ["!menu", "!premium", "!website", "!bot", "!order", "!admin"] } }
-        ]
-      }
+          { command: { in: ["!menu", "!premium", "!website", "!bot", "!order", "!admin"] } },
+        ],
+      },
     });
   } catch (e) {}
 }
@@ -133,7 +221,7 @@ async function startWhatsApp() {
   try {
     cleanupOldCommands().catch(() => {});
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
-    
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const version = await getSafeWaVersion();
 
@@ -150,8 +238,8 @@ async function startWhatsApp() {
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
       browser: Browsers.ubuntu("Chrome"),
-      syncFullHistory: false, 
-      shouldSyncHistoryMessage: () => false, 
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
       markOnlineOnConnect: true,
       keepAliveIntervalMs: 25000,
       connectTimeoutMs: 60000,
@@ -172,17 +260,17 @@ async function startWhatsApp() {
           try {
             const msg = await prisma.message.findUnique({ where: { waMessageId: key.id } });
             if (msg) return { conversation: msg.content };
-          } catch(e) {}
+          } catch (e) {}
         }
         return undefined;
-      }
+      },
     });
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update: any) => {
       const { connection, lastDisconnect, qr } = update;
-      
+
       if (qr) {
         try {
           currentQrDataUrl = await QRCode.toDataURL(qr, { margin: 2, width: 280 });
@@ -203,11 +291,6 @@ async function startWhatsApp() {
           currentStatus = "DISCONNECTED";
           currentQrDataUrl = null;
           currentPhone = null;
-          await prisma.whatsappConnection.upsert({
-            where: { sessionId: "primary" },
-            update: { status: ConnectionStatus.DISCONNECTED, phone: null },
-            create: { sessionId: "primary", status: ConnectionStatus.DISCONNECTED, phone: null },
-          }).catch(() => {});
           io.emit("whatsapp:status", { status: "DISCONNECTED", phone: null });
           setTimeout(startWhatsApp, 1500);
         } else {
@@ -222,16 +305,17 @@ async function startWhatsApp() {
         currentPairingCode = null;
         const botJid = sock.user?.id || "";
         currentPhone = botJid.split(":")[0] || botJid.split("@")[0];
-        
+
         myLogger.info(`WhatsApp Bot Terhubung 24/7 ke nomor: +${currentPhone}`);
-        await prisma.whatsappConnection.upsert({
-          where: { sessionId: "primary" },
-          update: { status: ConnectionStatus.CONNECTED, phone: currentPhone, lastActive: new Date() },
-          create: { sessionId: "primary", status: ConnectionStatus.CONNECTED, phone: currentPhone },
-        }).catch(() => {});
-        
+        prisma.whatsappConnection
+          .upsert({
+            where: { sessionId: "primary" },
+            update: { status: ConnectionStatus.CONNECTED, phone: currentPhone, lastActive: new Date() },
+            create: { sessionId: "primary", status: ConnectionStatus.CONNECTED, phone: currentPhone },
+          })
+          .catch(() => {});
+
         io.emit("whatsapp:status", { status: "CONNECTED", phone: currentPhone });
-        io.emit("dashboard:stats_update");
       }
     });
 
@@ -268,7 +352,7 @@ async function startWhatsApp() {
                   update: { isBlocked: true },
                   create: { phone: callerPhone, name: "Spam Caller", isBlocked: true },
                 });
-              } catch(e) {}
+              } catch (e) {}
               await sock.updateBlockStatus(callerJid, "block");
             }
           } catch (callErr) {}
@@ -284,288 +368,251 @@ async function startWhatsApp() {
         const config = await prisma.botConfig.findUnique({ where: { id: "default-config" } });
         if (config) isGlobalBotEnabled = config.isEnabled;
       } catch (e) {}
-      
+
       if (!isGlobalBotEnabled) return;
 
       for (const msg of m.messages) {
         if (!msg.message) continue;
-        if (m.type === "append" && !msg.key?.fromMe) continue;
         if (msg.key?.id) cacheMessage(msg.key.id, msg.message);
 
-        // Unwrap pesan bila berasal dari HP utama (deviceSentMessage), pesan sementara (ephemeral), atau viewOnce
-        const unwrappedMsg =
-          msg.message.deviceSentMessage?.message ||
-          msg.message.ephemeralMessage?.message ||
-          msg.message.viewOnceMessage?.message ||
-          msg.message.viewOnceMessageV2?.message ||
-          msg.message.viewOnceMessageV2Extension?.message ||
-          msg.message.documentWithCaptionMessage?.message ||
-          msg.message;
-
-        const remoteJid = msg.key.remoteJid || msg.message.deviceSentMessage?.destinationJid;
+        const remoteJid = msg.key.remoteJid;
         if (!remoteJid || remoteJid === "status@broadcast") continue;
         if (msg.key.id && botSentMessageIds.has(msg.key.id)) continue;
 
-        const hasMedia = Boolean(unwrappedMsg?.imageMessage || unwrappedMsg?.documentMessage || unwrappedMsg?.videoMessage);
-        const text = (
-          unwrappedMsg?.conversation ||
-          unwrappedMsg?.extendedTextMessage?.text ||
-          unwrappedMsg?.imageMessage?.caption ||
-          unwrappedMsg?.documentMessage?.caption ||
-          unwrappedMsg?.videoMessage?.caption ||
-          ""
-        ).trim();
+        const unwrapped = unwrapMessage(msg.message);
+        const text = extractMessageText(msg.message);
+        const isImage = !!unwrapped?.imageMessage;
+        const isDoc = !!unwrapped?.documentMessage;
 
-        if (!text && !hasMedia) continue;
+        if (!text && !isImage && !isDoc) continue;
 
         // =========================================================================
-        // FITUR TAMBAHAN: ADMIN REPLY BUKTI TRANSFER DENGAN KATA "PROSES"
+        // FITUR ADMIN: KETIK "PROSES" (MURNI DARI DATABASE KATALOG PRODUK)
         // =========================================================================
-        if (msg.key.fromMe && /^[.!]?proses(\b|\s|$)/i.test(text)) {
-          const quotedInfo =
-            unwrappedMsg?.extendedTextMessage?.contextInfo ||
-            unwrappedMsg?.imageMessage?.contextInfo ||
-            unwrappedMsg?.documentMessage?.contextInfo ||
-            msg.message?.extendedTextMessage?.contextInfo;
+        const isProsesCommand = /^!?proses(\b|\s)/i.test(text);
+        if (isProsesCommand && (msg.key.fromMe || m.type === "notify")) {
+          const contextInfo = extractContextInfo(msg.message);
+          const quotedMsg = unwrapMessage(contextInfo?.quotedMessage);
 
-          const rawQuotedMsg = quotedInfo?.quotedMessage;
-          const quotedMsg =
-            rawQuotedMsg?.ephemeralMessage?.message ||
-            rawQuotedMsg?.viewOnceMessage?.message ||
-            rawQuotedMsg?.viewOnceMessageV2?.message ||
-            rawQuotedMsg?.viewOnceMessageV2Extension?.message ||
-            rawQuotedMsg?.documentWithCaptionMessage?.message ||
-            rawQuotedMsg;
+          const targetJid = remoteJid.endsWith("@g.us")
+            ? contextInfo?.participant || remoteJid
+            : remoteJid;
+          const targetPhone = targetJid.split("@")[0].split(":")[0];
 
-          // Ambil teks baik dari percakapan teks biasa, extended, atau caption gambar bukti transfer
-          const quotedContent = (
-            quotedMsg?.conversation ||
-            quotedMsg?.extendedTextMessage?.text ||
-            quotedMsg?.imageMessage?.caption ||
-            quotedMsg?.documentMessage?.caption ||
-            ""
-          ).toLowerCase();
+          if (!msg.key.fromMe && !quotedMsg) {
+            // Abaikan jika bukan dari admin dan tidak me-reply pesan
+          } else {
+            const quotedContent = extractMessageText(quotedMsg);
+            const combinedSearchText = `${text} ${quotedContent}`;
 
-          // Dapatkan nomor WA pelanggan (jika di grup gunakan participant, jika chat pribadi gunakan remoteJid pelanggan)
-          const resolvedJid = remoteJid.endsWith("@g.us")
-            ? (quotedInfo?.participant || remoteJid)
-            : ((msg.key as any).remoteJidAlt || (msg.key as any).senderPn || remoteJid);
-          const targetPhone = resolvedJid.split("@")[0].split(":")[0];
-
-          let matchedProduct: any = null;
-          let finalPrice = 0;
-          let finalName = "Layanan Premium";
-
-          // 1. Cek apakah ada produk yang cocok dari teks/caption atau harga di database
-          let allProducts: any[] = [];
-          try {
-            allProducts = await prisma.product.findMany();
-            for (const p of allProducts) {
-              if (
-                (p.sku && (quotedContent.includes(p.sku.toLowerCase()) || text.toLowerCase().includes(p.sku.toLowerCase()))) ||
-                quotedContent.includes(p.name.toLowerCase()) ||
-                text.toLowerCase().includes(p.name.toLowerCase())
-              ) {
-                matchedProduct = p;
-                finalPrice = Number(p.price);
-                finalName = p.name;
-                break;
-              }
+            let allProducts: any[] = [];
+            let allKeywords: any[] = [];
+            try {
+              allProducts = await prisma.product.findMany({ where: { isActive: true } });
+            } catch (e) {
+              try { allProducts = await prisma.product.findMany(); } catch (err) {}
             }
-          } catch (e) {}
+            try {
+              allKeywords = await prisma.botKeyword.findMany({ where: { isActive: true } });
+            } catch (e) {}
 
-          // 2. Fallback pencocokan keyword bila belum ada di tabel Product
-          const combinedSearchText = `${text.toLowerCase()} ${quotedContent}`;
-          if (!matchedProduct) {
-            if (combinedSearchText.includes("capcut")) { finalName = "CapCut Pro"; finalPrice = 25000; }
-            else if (combinedSearchText.includes("netflix")) { finalName = "Netflix Premium"; finalPrice = 40000; }
-            else if (combinedSearchText.includes("canva")) { finalName = "Canva Pro"; finalPrice = 15000; }
-            else if (combinedSearchText.includes("bot") || combinedSearchText.includes("web")) { finalName = "Jasa Pembuatan Bot/Web"; finalPrice = 100000; }
-          }
+            // 1. Cari kecocokan produk & harga langsung dari Database (Product / BotKeyword)
+            let { product: matchedProduct, name: matchedName, price: finalPrice } =
+              matchCatalogItemFromText(combinedSearchText, allProducts, allKeywords);
 
-          // 3. Cek nominal yang diketik admin (misal: "proses 50000") atau yang tertera di bukti transfer/caption
-          const adminNominal = extractNominalFromText(text);
-          const quotedNominal = extractNominalFromText(quotedContent);
-          const detectedTransferNominal = adminNominal || quotedNominal;
+            let finalName = matchedName || "Layanan Katalog";
 
-          try {
-            // 4. Simpan/ambil data Customer terlebih dahulu
-            const customerRecord = await prisma.customer.upsert({
-              where: { phone: targetPhone },
-              update: {},
-              create: { phone: targetPhone, name: "Pelanggan Rama Store", isBlocked: false }
-            });
+            // 2. Cek apakah ada nominal spesifik di teks perintah admin atau caption bukti transfer
+            const adminNominal = extractNominalFromText(text);
+            const quotedNominal = extractNominalFromText(quotedContent);
+            const detectedTransferNominal = adminNominal || quotedNominal;
 
-            let convRecord = await prisma.conversation.findFirst({
-              where: { customerId: customerRecord.id, isArchived: false },
-              orderBy: { lastMessageAt: "desc" }
-            });
-            if (!convRecord) {
-              convRecord = await prisma.conversation.create({
-                data: { customerId: customerRecord.id, isBotActive: true, unreadCount: 0 }
+            try {
+              const customerRecord = await prisma.customer.upsert({
+                where: { phone: targetPhone },
+                update: {},
+                create: {
+                  phone: targetPhone,
+                  name: msg.pushName || "Pelanggan Rama Store",
+                  isBlocked: false,
+                },
               });
-            }
 
-            // 5. Cek apakah pelanggan punya Order berstatus PENDING (dari format ORDER#...)
-            const pendingOrder = await prisma.order.findFirst({
-              where: { customerId: customerRecord.id, status: "PENDING" },
-              orderBy: { createdAt: "desc" },
-              include: { items: true }
-            });
-
-            if (pendingOrder) {
-              if (!matchedProduct && pendingOrder.items && pendingOrder.items.length > 0) {
-                finalName = pendingOrder.items[0].productName || finalName;
+              let conv = await prisma.conversation.findFirst({
+                where: { customerId: customerRecord.id, isArchived: false },
+                orderBy: { lastMessageAt: "desc" },
+              });
+              if (!conv) {
+                conv = await prisma.conversation.create({
+                  data: { customerId: customerRecord.id, isBotActive: true, unreadCount: 0 },
+                });
               }
-              if (finalPrice === 0) {
-                finalPrice = Number(pendingOrder.totalAmount);
-              }
-            }
 
-            // 6. Jika masih belum ada nominal (karena bukti transfer berupa gambar tanpa caption), cek riwayat chat terakhir
-            if (!detectedTransferNominal && finalPrice === 0) {
-              const recentMsgs = await prisma.message.findMany({
-                where: { conversationId: convRecord.id },
+              // 3. Cek apakah pelanggan punya Order berstatus PENDING di database
+              const pendingOrder = await prisma.order.findFirst({
+                where: { customerId: customerRecord.id, status: "PENDING" },
                 orderBy: { createdAt: "desc" },
-                take: 6
+                include: { items: true },
               });
-              for (const rMsg of recentMsgs) {
-                const histText = (rMsg.content || "").toLowerCase();
-                const histNominal = extractNominalFromText(histText);
-                for (const p of allProducts) {
-                  if ((p.sku && histText.includes(p.sku.toLowerCase())) || histText.includes(p.name.toLowerCase())) {
-                    matchedProduct = p;
-                    finalName = p.name;
-                    finalPrice = Number(p.price);
+
+              if (pendingOrder) {
+                if (!matchedProduct && pendingOrder.items && pendingOrder.items.length > 0) {
+                  finalName = pendingOrder.items[0].productName || finalName;
+                  const itemProd = allProducts.find((p: any) => p.id === pendingOrder.items[0].productId);
+                  if (itemProd) matchedProduct = itemProd;
+                }
+                if (finalPrice === 0) {
+                  finalPrice = Number(pendingOrder.totalAmount);
+                }
+              }
+
+              // 4. Jika belum ketemu produk/harga (misal reply gambar tanpa caption), lacak dari riwayat chat terakhir pelanggan
+              if (finalPrice === 0) {
+                const recentMsgs = await prisma.message.findMany({
+                  where: { conversationId: conv.id },
+                  orderBy: { createdAt: "desc" },
+                  take: 10,
+                });
+                for (const rMsg of recentMsgs) {
+                  const histText = rMsg.content || "";
+                  const matchedHist = matchCatalogItemFromText(histText, allProducts, allKeywords);
+                  if (matchedHist.name) {
+                    matchedProduct = matchedHist.product;
+                    finalName = matchedHist.name;
+                    finalPrice = matchedHist.price;
                     break;
                   }
-                }
-                if (histNominal && finalPrice === 0) {
-                  finalPrice = histNominal;
-                }
-                if (finalPrice > 0) break;
-              }
-            }
-
-            // 7. Prioritaskan nominal asli yang ditransfer jika terdeteksi pada pesan/bukti transfer
-            if (detectedTransferNominal && detectedTransferNominal > 0) {
-              finalPrice = detectedTransferNominal;
-              if (!matchedProduct) {
-                const prodByPrice = allProducts.find((p: any) => Number(p.price) === detectedTransferNominal);
-                if (prodByPrice) {
-                  matchedProduct = prodByPrice;
-                  finalName = prodByPrice.name;
+                  const histNominal = extractNominalFromText(histText);
+                  if (histNominal && finalPrice === 0) {
+                    finalPrice = histNominal;
+                  }
                 }
               }
-            }
 
-            // Nilai fallback paling akhir jika sama sekali tidak ada nominal di mana pun
-            if (finalPrice <= 0) {
-              finalPrice = 25000;
-            }
+              // 5. Jika ada nominal transfer/input, cocokkan kembali dengan harga produk di database
+              if (detectedTransferNominal && detectedTransferNominal > 0) {
+                if (!matchedProduct) {
+                  const prodByPrice = allProducts.find(
+                    (p: any) => Number(p.price) === detectedTransferNominal
+                  );
+                  if (prodByPrice) {
+                    matchedProduct = prodByPrice;
+                    finalName = prodByPrice.name;
+                    finalPrice = Number(prodByPrice.price);
+                  } else {
+                    finalPrice = detectedTransferNominal;
+                  }
+                } else if (adminNominal) {
+                  finalPrice = adminNominal;
+                }
+              }
 
-            // 8. Update Order PENDING jika sudah ada, atau buat Order baru sesuai nominal transfer
-            try {
+              // 6. Jika masih belum ditemukan produk sama sekali di database, ambil produk pertama dari katalog database atau beri tahu admin
+              if (finalPrice <= 0 && matchedProduct) {
+                finalPrice = Number(matchedProduct.price);
+              }
+
+              if (finalPrice <= 0) {
+                await sendTextMessage(
+                  remoteJid,
+                  conv.id,
+                  `⚠️ *PRODUK / HARGA TIDAK DITEMUKAN DI DATABASE*\n\nTidak dapat menemukan produk katalog pada riwayat chat ini.\nSilakan ketik: *proses [Nama Produk Katalog]* atau *proses [Nominal]*`
+                );
+                continue;
+              }
+
+              // 7. Update Order PENDING atau buat Order baru berstatus PROCESSING
+              let updatedOrCreatedOrder: any = null;
               if (pendingOrder) {
-                await prisma.order.update({
+                updatedOrCreatedOrder = await prisma.order.update({
                   where: { id: pendingOrder.id },
                   data: {
                     subtotal: finalPrice,
                     totalAmount: finalPrice,
                     status: "PROCESSING",
-                    customerNotes: `${pendingOrder.customerNotes || ""} | Bukti transfer diverifikasi admin (Rp ${finalPrice.toLocaleString("id-ID")})`
-                  }
+                    customerNotes: `${
+                      pendingOrder.customerNotes || ""
+                    } | Diverifikasi admin (Rp ${finalPrice.toLocaleString("id-ID")})`,
+                  },
                 });
               } else {
-                const orderNum = `RS-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
-                await prisma.order.create({
+                const orderNum = `RS-${new Date().getFullYear()}-${Math.floor(
+                  1000 + Math.random() * 9000
+                )}`;
+                updatedOrCreatedOrder = await prisma.order.create({
                   data: {
                     orderNumber: orderNum,
                     customerId: customerRecord.id,
                     subtotal: finalPrice,
                     totalAmount: finalPrice,
                     status: "PROCESSING",
-                    customerNotes: `Bukti transfer diverifikasi admin (${finalName} - Rp ${finalPrice.toLocaleString("id-ID")})`,
-                    items: matchedProduct ? {
-                      create: {
-                        productId: matchedProduct.id,
-                        productName: matchedProduct.name,
-                        unitPrice: finalPrice,
-                        quantity: 1,
-                        subtotal: finalPrice
-                      }
-                    } : undefined
-                  }
+                    customerNotes: `Diverifikasi admin (${finalName} - Rp ${finalPrice.toLocaleString(
+                      "id-ID"
+                    )})`,
+                    items: matchedProduct
+                      ? {
+                          create: {
+                            productId: matchedProduct.id,
+                            productName: matchedProduct.name,
+                            unitPrice: finalPrice,
+                            quantity: 1,
+                            subtotal: finalPrice,
+                          },
+                        }
+                      : undefined,
+                  },
                 });
               }
-            } catch (orderErr) {
-              console.error("Gagal menyimpan order:", orderErr);
-            }
 
-            // 9. Catat / Update Omset sesuai nominal yang ditransfer
-            const todayDate = new Date();
-            todayDate.setHours(0, 0, 0, 0);
+              // 8. Catat / Update Omset Harian
+              const todayDate = new Date();
+              todayDate.setHours(0, 0, 0, 0);
+              try {
+                if ((prisma as any).omset) {
+                  await (prisma as any).omset.upsert({
+                    where: { tanggal: todayDate },
+                    update: { total: { increment: finalPrice } },
+                    create: { tanggal: todayDate, total: finalPrice },
+                  });
+                }
+              } catch (omsetErr) {}
 
-            try {
-              if ((prisma as any).omset) {
-                await (prisma as any).omset.upsert({
-                  where: { tanggal: todayDate },
-                  update: { total: { increment: finalPrice } },
-                  create: { tanggal: todayDate, total: finalPrice }
-                });
-              }
-            } catch (omsetErr) {}
-
-            // 10. Balas otomatis: Transaksi Sedang Diproses sesuai nominal
-            const prosesText = `⏳ *TRANSAKSI SEDANG DIPROSES*
+              // 9. Kirim balasan konfirmasi otomatis & emit real-time ke Dashboard
+              const prosesText = `⏳ *TRANSAKSI SEDANG DIPROSES*
 
 Halo Kak! Bukti pembayaran telah kami terima dan diverifikasi.
 
+🧾 No. Pesanan: *${updatedOrCreatedOrder.orderNumber}*
 📦 Layanan: *${finalName}*
 💰 Total: *Rp ${finalPrice.toLocaleString("id-ID")}*
 Status: *SEDANG DIPROSES* ⚙️
 
 Pesanan/akun Anda sedang disiapkan oleh admin. Mohon ditunggu 5-10 menit, ya!`;
 
-            await sendTextMessage(remoteJid, convRecord.id, prosesText);
-            io.emit("dashboard:stats_update");
-          } catch (err) {
-            console.error("Gagal memproses pesanan otomatis:", err);
+              await sendTextMessage(remoteJid, conv.id, prosesText);
+
+              io.emit("order:updated", updatedOrCreatedOrder);
+              io.emit("dashboard:stats_update");
+              io.emit("message:outgoing", { conversationId: conv.id });
+            } catch (err) {
+              console.error("Gagal memproses pesanan otomatis:", err);
+            }
+            continue;
           }
-          continue; // Lanjut ke pesan berikutnya
         }
         // =========================================================================
 
-        if (msg.key.fromMe) {
-          if (recentBotReplies.has(text)) continue;
-          // Catat pesan manual dari admin ke database agar tampil real-time di dashboard
-          const targetChatJid = (msg.key as any).remoteJidAlt || (msg.key as any).senderPn || remoteJid;
-          const targetChatPhone = targetChatJid.split("@")[0].split(":")[0];
-          try {
-            const cust = await prisma.customer.findUnique({ where: { phone: targetChatPhone } });
-            if (cust) {
-              const conv = await prisma.conversation.findFirst({ where: { customerId: cust.id, isArchived: false } });
-              if (conv && text) {
-                await prisma.message.create({
-                  data: { conversationId: conv.id, senderType: "BOT", type: "TEXT", content: text, waMessageId: msg.key.id || undefined, status: "SENT" }
-                }).catch(() => {});
-                await prisma.conversation.update({
-                  where: { id: conv.id },
-                  data: { lastMessageAt: new Date() }
-                }).catch(() => {});
-                io.emit("message:outgoing", { conversationId: conv.id });
-                io.emit("dashboard:stats_update");
-              }
-            }
-          } catch (e) {}
-          continue;
-        }
+        if (msg.key.fromMe) continue;
+        if (text && recentBotReplies.has(text)) continue;
+        if (m.type === "append") continue;
 
-        const resolvedSenderJid = (msg.key as any).remoteJidAlt || (msg.key as any).senderPn || remoteJid;
-        const senderPhone = resolvedSenderJid.split("@")[0].split(":")[0];
+        const senderPhone = remoteJid.split("@")[0].split(":")[0];
         const customerName = msg.pushName || "Sobat Premium";
-        const effectiveText = text || "[Bukti Transfer / Media]";
-        handleIncomingMessage(remoteJid, senderPhone, customerName, effectiveText, msg).catch(() => {});
+        const displayContent = text || (isImage ? "[Bukti Gambar / Foto]" : "[Dokumen]");
+
+        handleIncomingMessage(remoteJid, senderPhone, customerName, displayContent, msg).catch(
+          (err) => console.error("Error handleIncomingMessage:", err)
+        );
       }
     });
   } catch (error) {
@@ -576,43 +623,60 @@ Pesanan/akun Anda sedang disiapkan oleh admin. Mohon ditunggu 5-10 menit, ya!`;
 
 io.on("connection", (socket) => {
   socket.emit("whatsapp:status", { status: currentStatus, phone: currentPhone });
-  if (currentQrDataUrl && currentStatus === "QR_READY") socket.emit("whatsapp:qr", { qr: currentQrDataUrl });
-  if (currentPairingCode && currentStatus === "PAIRING_CODE_READY") socket.emit("whatsapp:pairing-code", { code: currentPairingCode });
+  if (currentQrDataUrl && currentStatus === "QR_READY")
+    socket.emit("whatsapp:qr", { qr: currentQrDataUrl });
+  if (currentPairingCode && currentStatus === "PAIRING_CODE_READY")
+    socket.emit("whatsapp:pairing-code", { code: currentPairingCode });
 });
 
-async function handleIncomingMessage(jid: string, phone: string, name: string, text: string, rawMsg: proto.IWebMessageInfo) {
+async function handleIncomingMessage(
+  jid: string,
+  phone: string,
+  name: string,
+  text: string,
+  rawMsg: proto.IWebMessageInfo
+) {
   try {
-    let customer = await prisma.customer.findUnique({ where: { phone } });
-
-    if (!customer) {
-      customer = await prisma.customer.create({
-        data: { phone, name, isBlocked: false }
-      }).catch(() => null);
-    }
-
-    if (!customer) {
-      const temporaryCustomer = { id: "UNREGISTERED", name, phone, isBlocked: false };
-      await processBotAutomations(jid, null, text.trim(), temporaryCustomer);
-      return; 
-    }
+    const customer = await prisma.customer.upsert({
+      where: { phone },
+      update: { name: name !== "Sobat Premium" ? name : undefined },
+      create: { phone, name, isBlocked: false },
+    });
 
     if (customer.isBlocked) return;
 
-    let conversation = await prisma.conversation.findFirst({ where: { customerId: customer.id, isArchived: false } });
+    let conversation = await prisma.conversation.findFirst({
+      where: { customerId: customer.id, isArchived: false },
+    });
+
     if (!conversation) {
-      conversation = await prisma.conversation.create({ data: { customerId: customer.id, isBotActive: true, unreadCount: 1 } });
+      conversation = await prisma.conversation.create({
+        data: { customerId: customer.id, isBotActive: true, unreadCount: 1, lastMessageAt: new Date() },
+      });
     } else {
-      await prisma.conversation.update({
+      conversation = await prisma.conversation.update({
         where: { id: conversation.id },
-        data: { lastMessageAt: new Date(), unreadCount: { increment: 1 } }
-      }).catch(() => {});
+        data: { lastMessageAt: new Date(), unreadCount: { increment: 1 } },
+      });
     }
 
-    await prisma.message.create({
-      data: { conversationId: conversation.id, senderType: "CUSTOMER", type: "TEXT", content: text, waMessageId: rawMsg.key.id || undefined, status: "DELIVERED" },
-    }).catch(() => {});
+    const savedMsg = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        senderType: "CUSTOMER",
+        type: "TEXT",
+        content: text,
+        waMessageId: rawMsg.key.id || undefined,
+        status: "DELIVERED",
+      },
+    });
 
-    io.emit("message:incoming", { conversationId: conversation.id }); 
+    io.emit("message:incoming", {
+      conversationId: conversation.id,
+      message: savedMsg,
+      customer,
+    });
+    io.emit("conversation:updated", conversation);
     io.emit("dashboard:stats_update");
 
     if (conversation.isBotActive === false && text.toLowerCase().trim() !== "menu") {
@@ -620,7 +684,9 @@ async function handleIncomingMessage(jid: string, phone: string, name: string, t
     }
 
     await processBotAutomations(jid, conversation.id, text.trim(), customer);
-  } catch (err) {}
+  } catch (err) {
+    console.error("Gagal menyimpan pesan masuk:", err);
+  }
 }
 
 async function processBotAutomations(jid: string, convId: string | null, text: string, customer: any) {
@@ -630,10 +696,10 @@ async function processBotAutomations(jid: string, convId: string | null, text: s
   // 1. COMMAND: MENU
   if (cleanText === "menu" || cleanText === "premium") {
     if (convId) {
-      await prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
+      prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
     }
     const { greeting, dateStr, timeStr } = getDynamicGreetingAndDate();
-    
+
     const reply = `Halo, Kak *${customer.name}*! 👋
 Selamat ${greeting}
 
@@ -653,26 +719,46 @@ Selamat datang di *Rama Store* (Aplikasi Premium Murah).
 • Ketik salah satu menu di atas untuk akses.
 • Dilarang spam pesan/telepon (Auto-Block).
 • Transaksi pembayaran 100% aman.`;
-    
+
     await sendTextMessage(jid, convId, reply);
     return;
   }
 
-  // 2. COMMAND: LAYANAN / PRODUK / LIST
+  // 2. COMMAND: LAYANAN / PRODUK / LIST (MENAMPILKAN KATALOG DARI DATABASE)
   if (cleanText === "layanan" || cleanText === "produk" || cleanText === "list") {
     if (convId) {
-      await prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
+      prisma.conversation.update({ where: { id: convId }, data: { isBotActive: true } }).catch(() => {});
     }
-    
+
     let keywords: any[] = [];
+    let products: any[] = [];
     try {
-      keywords = await prisma.botKeyword.findMany({ where: { isActive: true }, orderBy: { keyword: "asc" } });
-    } catch(e) {}
-    
-    const productItems = keywords.map((k: any) => {
-      const cleanKeyword = k.keyword.replace(/[^\w\s]/gi, '').trim().toUpperCase();
-      return ` ✦  *${cleanKeyword}*`;
-    }).join("\n");
+      keywords = await prisma.botKeyword.findMany({
+        where: { isActive: true },
+        orderBy: { keyword: "asc" },
+      });
+    } catch (e) {}
+    try {
+      products = await prisma.product.findMany({
+        where: { isActive: true },
+        orderBy: { name: "asc" },
+      });
+    } catch (e) {}
+
+    const catalogSet = new Set<string>();
+    for (const k of keywords) {
+      const cleanKeyword = k.keyword.replace(/[^\w\s]/gi, "").trim().toUpperCase();
+      if (cleanKeyword) catalogSet.add(` ✦  *${cleanKeyword}*`);
+    }
+    for (const p of products) {
+      const label = (p.sku || p.name).trim().toUpperCase();
+      const priceFmt = `Rp ${Number(p.price).toLocaleString("id-ID")}`;
+      if (label && !Array.from(catalogSet).some((item) => item.includes(`*${label}*`))) {
+        catalogSet.add(` ✦  *${label}* — ${priceFmt}`);
+      }
+    }
+
+    const productItems = Array.from(catalogSet).join("\n");
 
     const replyLayanan = `🛒 *LIST MENU RAMA STORE*
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
@@ -689,7 +775,12 @@ Silakan ketik nama menu di atas dengan huruf kapital (Contoh: *WEBSITE*) untuk m
   }
 
   // 3. COMMAND: SEWA BOT
-  if (cleanText === "sewa" || cleanText === "bot" || cleanText === "order bot" || cleanText === "sewa bot") {
+  if (
+    cleanText === "sewa" ||
+    cleanText === "bot" ||
+    cleanText === "order bot" ||
+    cleanText === "sewa bot"
+  ) {
     const replyBotOrder = `🤖 *JASA PEMBUATAN & SEWA BOT WHATSAPP*
 > Profesional, Otomatis, & Bergaransi!
 
@@ -712,9 +803,9 @@ Fitur: Auto-reply 24/7, manajemen pesanan, broadcast, & integrasi database.\n
     let paymentConfig: any = null;
     try {
       paymentConfig = await prisma.paymentConfig.findUnique({ where: { id: "default-payment" } });
-    } catch(e) {}
+    } catch (e) {}
     const gopay = paymentConfig?.gopay || "088227142563";
-    
+
     const paymentText = `💳 *INFORMASI PEMBAYARAN RESMI*
 MUHAMMAD SYAFIQ RAMADANI DIGITAL & CREATIV
 
@@ -738,19 +829,8 @@ Ketik: \`ORDER#WEBSITE#NAMA_BISNIS#FITUR_YANG_DIINGINKAN\``;
       try {
         const base64Data = paymentConfig.qrisBase64.split(",")[1];
         const buffer = Buffer.from(base64Data, "base64");
-        registerBotOutbox(undefined, paymentText);
         const sentImg = await sock.sendMessage(jid, { image: buffer, caption: paymentText });
-        if (sentImg?.key?.id) {
-          registerBotOutbox(sentImg.key.id, paymentText);
-          cacheMessage(sentImg.key.id, sentImg.message);
-        }
-        if (convId) {
-          await prisma.message.create({
-            data: { conversationId: convId, senderType: "BOT", type: "TEXT", content: paymentText, waMessageId: sentImg?.key?.id || undefined, status: "SENT" }
-          }).catch(() => {});
-          io.emit("message:outgoing", { conversationId: convId });
-        }
-        io.emit("dashboard:stats_update");
+        if (sentImg?.key?.id) cacheMessage(sentImg.key.id, sentImg.message);
         return;
       } catch (e) {}
     }
@@ -760,10 +840,6 @@ Ketik: \`ORDER#WEBSITE#NAMA_BISNIS#FITUR_YANG_DIINGINKAN\``;
 
   // 5. COMMAND: ORDERAN
   if (cleanText === "orderan" || cleanText === "cek order" || cleanText === "pesanan") {
-    if (customer.id === "UNREGISTERED") {
-      await sendTextMessage(jid, convId, `📦 Anda belum terdaftar di sistem kami dan belum memiliki riwayat pesanan aktif.`);
-      return;
-    }
     let orders: any[] = [];
     try {
       orders = await prisma.order.findMany({
@@ -772,45 +848,63 @@ Ketik: \`ORDER#WEBSITE#NAMA_BISNIS#FITUR_YANG_DIINGINKAN\``;
         take: 3,
         include: { items: true },
       });
-    } catch(e) {}
+    } catch (e) {}
 
     if (orders.length === 0) {
-      await sendTextMessage(jid, convId, `📦 Anda belum memiliki riwayat pesanan aktif.\n\nSilakan ketik *menu* atau *layanan* untuk melihat produk kami.`);
+      await sendTextMessage(
+        jid,
+        convId,
+        `📦 Anda belum memiliki riwayat pesanan aktif.\n\nSilakan ketik *menu* atau *layanan* untuk melihat produk kami.`
+      );
       return;
     }
 
-    const orderList = orders.map((o: any) => 
-      `• No: *${o.orderNumber}*\n  Status: *${o.status}*\n  Total: Rp ${Number(o.totalAmount).toLocaleString("id-ID")}`
-    ).join("\n\n");
+    const orderList = orders
+      .map(
+        (o: any) =>
+          `• No: *${o.orderNumber}*\n  Status: *${o.status}*\n  Total: Rp ${Number(
+            o.totalAmount
+          ).toLocaleString("id-ID")}`
+      )
+      .join("\n\n");
 
-    await sendTextMessage(jid, convId, `📦 *RIWAYAT PESANAN TERAKHIR ANDA*\n\n${orderList}\n\nPastikan Anda sudah mengirimkan screenshot bukti pembayaran ke chat ini.`);
+    await sendTextMessage(
+      jid,
+      convId,
+      `📦 *RIWAYAT PESANAN TERAKHIR ANDA*\n\n${orderList}\n\nPastikan Anda sudah mengirimkan screenshot bukti pembayaran ke chat ini.`
+    );
     return;
   }
 
   // 6. COMMAND: ADMIN
   if (cleanText === "admin" || cleanText === "cs") {
     if (convId) {
-      await prisma.conversation.update({
-        where: { id: convId },
-        data: { isBotActive: false },
-      }).catch(() => {});
+      prisma.conversation
+        .update({
+          where: { id: convId },
+          data: { isBotActive: false },
+        })
+        .catch(() => {});
     }
-    await sendTextMessage(jid, convId, "👨‍💻 Anda telah terhubung ke Live Agent (Admin). Silakan sampaikan pesan Anda, admin akan segera membalas.");
+    await sendTextMessage(
+      jid,
+      convId,
+      "👨‍💻 Anda telah terhubung ke Live Agent (Admin). Silakan sampaikan pesan Anda, admin akan segera membalas."
+    );
     return;
   }
 
-  // 7. DINAMIS KEYWORD DARI KATALOG MENU (Hanya merespons jika diketik persis nama produknya)
+  // 7. DINAMIS KEYWORD DARI KATALOG MENU DATABASE
   let keywords: any[] = [];
   try {
     keywords = await prisma.botKeyword.findMany({ where: { isActive: true } });
-  } catch(e) {}
-  
+  } catch (e) {}
+
   for (const kw of keywords) {
-    const dbKeyClean = kw.keyword.replace(/[^\w\s]/gi, '').trim().toUpperCase();
+    const dbKeyClean = kw.keyword.replace(/[^\w\s]/gi, "").trim().toUpperCase();
     if (upperText === kw.keyword.toUpperCase() || upperText === dbKeyClean) {
-      
       let customResponse = kw.response;
-      
+
       if (dbKeyClean.includes("WEB") || dbKeyClean.includes("BOT")) {
         customResponse += `\n\n━━━━━━━━━━━━━━━━━━━━━\n🛒 *CARA ORDER KHUSUS LAYANAN INI:*\n1. Ketik *payment* dan lakukan pembayaran.\n2. Screenshot bukti pembayaran.\n3. Kirim format order:\n   \`ORDER#${dbKeyClean}#Nama Bisnis#Catatan Fitur\``;
       } else {
@@ -822,55 +916,94 @@ Ketik: \`ORDER#WEBSITE#NAMA_BISNIS#FITUR_YANG_DIINGINKAN\``;
     }
   }
 
-  // 8. ORDER FORMAT CHECKOUT (SMART SYSTEM)
+  // 8. ORDER FORMAT CHECKOUT (MURNI DARI DATABASE PRODUCT / KATALOG)
   if (upperText.startsWith("ORDER#")) {
-    if (customer.id === "UNREGISTERED") {
-      await sendTextMessage(jid, convId, `❌ *GAGAL ORDER*\n\nMaaf kak, nomor WhatsApp Anda belum terdaftar di database Rama Store.\n\nSilakan ketik *admin* untuk meminta admin kami mendaftarkan nomor Anda terlebih dahulu.`);
-      return;
-    }
-
     const parts = text.split("#");
     if (parts.length >= 2) {
       const sku = parts[1].trim().toUpperCase();
-      let customerInputName = customer.name; 
+      let customerInputName = customer.name;
       let notes = "Pemesanan Produk Digital via Bot";
 
       if (parts.length >= 4) {
-         customerInputName = parts[2].trim();
-         notes = parts[3].trim();
+        customerInputName = parts[2].trim();
+        notes = parts[3].trim();
       } else if (parts.length === 3) {
-         notes = parts[2].trim();
+        notes = parts[2].trim();
       }
 
       let product: any = null;
       try {
         product = await prisma.product.findFirst({
-          where: { OR: [{ sku: { equals: sku, mode: "insensitive" } }, { name: { contains: sku, mode: "insensitive" } }] },
+          where: {
+            OR: [
+              { sku: { equals: sku, mode: "insensitive" } },
+              { name: { contains: sku, mode: "insensitive" } },
+            ],
+          },
         });
-      } catch(e) {}
+      } catch (e) {}
 
-      if (product) {
-        const orderNumber = `RS-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
-        try {
-          const newOrder = await prisma.order.create({
-            data: {
-              orderNumber, 
-              customerId: customer.id, 
-              subtotal: product.price, 
-              totalAmount: product.price, 
-              status: "PENDING", 
-              customerNotes: `${customerInputName} - ${notes}`,
-              items: { create: { productId: product.id, productName: product.name, unitPrice: product.price, quantity: 1, subtotal: product.price } },
-            },
-          });
-          io.emit("dashboard:stats_update");
-          
-          const invoiceReply = `🎉 *INVOICE PESANAN BERHASIL DIBUAT*
+      // Jika belum ada di tabel Product, cek di tabel BotKeyword katalog menu
+      let catalogKeyword: any = null;
+      if (!product) {
+        catalogKeyword = keywords.find((k: any) => {
+          const cleanK = k.keyword.replace(/[^\w\s]/gi, "").trim().toUpperCase();
+          return cleanK === sku || k.keyword.toUpperCase() === sku;
+        });
+      }
+
+      if (!product && !catalogKeyword) {
+        await sendTextMessage(
+          jid,
+          convId,
+          `❌ *PRODUK TIDAK DITEMUKAN*\n\nProduk *${sku}* tidak terdaftar di katalog kami. Silakan ketik *list* untuk melihat daftar produk yang tersedia.`
+        );
+        return;
+      }
+
+      const finalPrice = product
+        ? Number(product.price)
+        : extractNominalFromText(catalogKeyword?.response || "") || 0;
+      const finalProductName = product
+        ? product.name
+        : catalogKeyword.keyword.replace(/[^\w\s]/gi, "").trim().toUpperCase();
+
+      const orderNumber = `RS-${new Date().getFullYear()}-${Math.floor(
+        1000 + Math.random() * 9000
+      )}`;
+
+      try {
+        const newOrder = await prisma.order.create({
+          data: {
+            orderNumber,
+            customerId: customer.id,
+            subtotal: finalPrice,
+            totalAmount: finalPrice,
+            status: "PENDING",
+            customerNotes: `${customerInputName} - ${notes}`,
+            items: product
+              ? {
+                  create: {
+                    productId: product.id,
+                    productName: product.name,
+                    unitPrice: product.price,
+                    quantity: 1,
+                    subtotal: product.price,
+                  },
+                }
+              : undefined,
+          },
+        });
+
+        io.emit("order:created", newOrder);
+        io.emit("dashboard:stats_update");
+
+        const invoiceReply = `🎉 *INVOICE PESANAN BERHASIL DIBUAT*
 
 Nomor Invoice: *${newOrder.orderNumber}*
 Pemesan: ${customerInputName}
-Layanan: ${product.name}
-Total Tagihan: *Rp ${Number(product.price).toLocaleString("id-ID")}*
+Layanan: ${finalProductName}
+Total Tagihan: *Rp ${finalPrice.toLocaleString("id-ID")}*
 Status: *MENUNGGU PEMBAYARAN & BUKTI TRANSFER*
 Catatan: ${notes}
 
@@ -878,15 +1011,13 @@ Catatan: ${notes}
 📌 *LANGKAH TERAKHIR:*
 Jika Anda belum mengirimkan bukti transfer, silakan ketik *payment* lalu screenshot dan kirim buktinya ke sini. Admin akan memproses pesanan Anda maksimal 5-10 menit!`;
 
-          await sendTextMessage(jid, convId, invoiceReply);
-        } catch(e) {}
-        return;
+        await sendTextMessage(jid, convId, invoiceReply);
+      } catch (e) {
+        console.error("Gagal membuat order:", e);
       }
+      return;
     }
   }
-
-  // TANPA FALLBACK OTOMATIS:
-  // Jika pesan yang masuk adalah chat biasa (bukan command di atas), bot akan diam dan tidak mengganggu obrolan.
 }
 
 async function sendTextMessage(jid: string, conversationId: string | null, text: string) {
@@ -898,24 +1029,49 @@ async function sendTextMessage(jid: string, conversationId: string | null, text:
       registerBotOutbox(sent.key.id, text);
       cacheMessage(sent.key.id, sent.message || { conversation: text });
     }
-    
+
     if (conversationId) {
-      await prisma.message.create({
-        data: { conversationId, senderType: "BOT", type: "TEXT", content: text, waMessageId: sent?.key?.id || undefined, status: "SENT" }
-      }).catch(() => {});
-      await prisma.conversation.update({
-        where: { id: conversationId },
-        data: { lastMessageAt: new Date() }
-      }).catch(() => {});
-      io.emit("message:outgoing", { conversationId }); 
+      const savedBotMsg = await prisma.message.create({
+        data: {
+          conversationId,
+          senderType: "BOT",
+          type: "TEXT",
+          content: text,
+          waMessageId: sent?.key?.id || undefined,
+          status: "SENT",
+        },
+      });
+      io.emit("message:outgoing", { conversationId, message: savedBotMsg });
       io.emit("dashboard:stats_update");
     } else {
       io.emit("dashboard:stats_update");
     }
-  } catch(e) {}
+  } catch (e) {}
 }
 
-app.get("/api/internal/status", (req, res) => res.json({ success: true, data: { status: currentStatus, phone: currentPhone } }));
+app.get("/api/internal/status", (req, res) =>
+  res.json({ success: true, data: { status: currentStatus, phone: currentPhone } })
+);
+
+app.post("/api/internal/send-message", async (req, res) => {
+  const { phone, text, conversationId } = req.body;
+  if (!phone || !text || !sock) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Parameter tidak lengkap atau bot belum terhubung" });
+  }
+  try {
+    let cleaned = phone.replace(/\D/g, "");
+    if (cleaned.startsWith("0")) cleaned = "62" + cleaned.substring(1);
+    const jid = `${cleaned}@s.whatsapp.net`;
+
+    await sendTextMessage(jid, conversationId || null, text);
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Gagal mengirim pesan" });
+  }
+});
+
 app.post("/api/internal/request-pairing", async (req, res) => {
   const { phoneNumber } = req.body;
   if (!phoneNumber) return res.status(400).json({ success: false, message: "Nomor wajib diisi" });
@@ -923,16 +1079,23 @@ app.post("/api/internal/request-pairing", async (req, res) => {
     if (currentStatus !== "CONNECTED") {
       if (sock) {
         sock.ev.removeAllListeners();
-        try { sock.ws?.close(); } catch (e) {}
+        try {
+          sock.ws?.close();
+        } catch (e) {}
         sock = null;
       }
       isConnecting = false;
-      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+      try {
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      } catch (e) {}
       await startWhatsApp();
     }
 
     let attempts = 0;
-    while (!sock && attempts < 10) { await new Promise((r) => setTimeout(r, 500)); attempts++; }
+    while (!sock && attempts < 10) {
+      await new Promise((r) => setTimeout(r, 500));
+      attempts++;
+    }
     if (!sock) return res.status(500).json({ success: false, message: "Engine belum siap" });
 
     let cleanedNumber = phoneNumber.replace(/\D/g, "");
@@ -948,7 +1111,11 @@ app.post("/api/internal/request-pairing", async (req, res) => {
       await prisma.whatsappConnection.upsert({
         where: { sessionId: "primary" },
         update: { status: ConnectionStatus.PAIRING_CODE_READY, pairingCode: formattedCode },
-        create: { sessionId: "primary", status: ConnectionStatus.PAIRING_CODE_READY, pairingCode: formattedCode },
+        create: {
+          sessionId: "primary",
+          status: ConnectionStatus.PAIRING_CODE_READY,
+          pairingCode: formattedCode,
+        },
       });
     } catch (e) {}
 
@@ -964,21 +1131,14 @@ app.post("/api/internal/disconnect", async (req, res) => {
   if (sock) await sock.logout();
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-  } catch(e) {}
+  } catch (e) {}
   currentStatus = "DISCONNECTED";
   currentPairingCode = null;
   currentPhone = null;
-  await prisma.whatsappConnection.upsert({
-    where: { sessionId: "primary" },
-    update: { status: ConnectionStatus.DISCONNECTED, phone: null, pairingCode: null },
-    create: { sessionId: "primary", status: ConnectionStatus.DISCONNECTED, phone: null, pairingCode: null },
-  }).catch(() => {});
-  io.emit("whatsapp:status", { status: "DISCONNECTED", phone: null });
-  io.emit("dashboard:stats_update");
   return res.json({ success: true });
 });
 
 server.listen(4000, "0.0.0.0", () => {
-  myLogger.info(`WhatsApp Bot Engine berjalan pada http://127.0.0.1:4000`);
+  myLogger.info(`WhatsApp Bot Engine berjalan pada http://0.0.0.0:4000`);
   startWhatsApp();
 });
